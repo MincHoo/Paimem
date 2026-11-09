@@ -605,19 +605,20 @@ def candidates(con, qv, scope, query="", include_cold=False, include_drafts=Fals
     if not extra_ids:
         return sem
 
-    # BM25 给扩展项补 similarity
-    corpus = [(r["id"], r["content"] or "") for r, _ in all_pairs]   # 全量语料，不是候选
-    score_fn, _ = build_bm25(corpus)
-    bm = score_fn(query)
-    mx = max(bm.values()) if bm else 0.0
+    # 扩展项的 similarity 用**真实余弦**，不能拿归一化 BM25 冒充。
+    # 踩过的坑：BM25 归一到 [0,1] 会产出 sim=1.0，量纲远高于 e5 的 0.80~0.89 窄带，
+    # 结果一条纯词面匹配的无关记忆能压掉所有语义候选（实测把第 1 名挤到第 10）。
+    # 图路径强度也按余弦量纲折算后再取 max。
+    cos_of = {r["id"]: float(sv) for r, sv in all_pairs}
     q = ",".join("?" * len(extra_ids))
     ex_rows = con.execute("SELECT id, content, claim_type, origin, verified, scope, "
                           "importance, n_tok, created_at, last_hit, tags, status, cold "
                           "FROM mem_items WHERE id IN (%s)" % q, extra_ids).fetchall()
     for r in ex_rows:
-        bm_sim = (bm.get(r["id"], 0.0) / mx) if mx > 0 else 0.0
-        sim = max(bm_sim, path.get(r["id"], 0.0))   # 词面或图路径，取强者
-        sem.append((r, sim))
+        cos = cos_of.get(r["id"], 0.0)
+        # 路径强度 0~0.85，折算到余弦下沿，只做轻微抬升
+        boost = 0.03 * min(1.0, path.get(r["id"], 0.0) / 0.85) if path.get(r["id"]) else 0.0
+        sem.append((r, min(cos + boost, 0.999)))
     return sem
 
 
@@ -663,6 +664,12 @@ def score_base(row, sim, now, q_grams):
     return (W_CONTENT * float(sim) + W_TAGS * tag_cov + W_KEYWORD * kw_cov) / W_DENOM
 
 
+# 铁律 3「self 源默认易腐」的系数。
+# 实测：×0.33 会让 AI 自己写的记忆几乎检索不到（20 题 Hit@3 60%）；
+# 去掉惩罚升到 85%，但会削弱防回音壁。取 0.8 折中，可用配置覆盖。
+DECAY_SELF_FACTOR = 0.8
+
+
 def decay_factor(row, now):
     """新鲜度 × 重要性 × 来源可信（作为乘数，不参与分母）"""
     hl = CLAIM_HALFLIFE.get(row["claim_type"], 35)
@@ -670,7 +677,7 @@ def decay_factor(row, now):
     last = row["last_hit"] or row["created_at"] or now
     f = math.exp(-lam * (now - last) / 86400)
     if row["origin"] == "self":
-        f *= 0.33
+        f *= DECAY_SELF_FACTOR
     f *= 0.70 + 0.30 * float(row["importance"] or 0.5)
     return f
 
