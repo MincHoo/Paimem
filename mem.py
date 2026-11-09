@@ -86,6 +86,10 @@ DEFAULTS = {
     "segment.drift_threshold": "0",
     "segment.max_turns": "15",
     "segment.max_tokens": "12000",
+    "llm.endpoint": "https://opencode.ai/inference/go/openai/v1",
+    "llm.model": "deepseek-v4.1-flash",
+    "llm.api_key": "",
+    "llm.timeout": "180",
 }
 
 CLAIM_HALFLIFE = {"fact": 35, "preference": 180, "decision": 90,
@@ -248,6 +252,8 @@ CREATE TABLE IF NOT EXISTS mem_segments(
   files TEXT,                -- JSON 数组
   cmds TEXT,                 -- JSON 数组
   errors INTEGER DEFAULT 0,
+  statements TEXT,           -- L2 提炼出的陈述（JSON 数组）
+  enriched INTEGER DEFAULT 0,
   vector BLOB,
   created_at INTEGER
 );
@@ -1583,6 +1589,168 @@ def cmd_ingest(a):
 
 
 
+
+# ---------------- L2：用 LLM 把段升级成可检索的标题与陈述 ----------------
+SEGMENT_PROMPT = """你是会话记忆整理器。下面是一段编程会话的对话记录（可能含代码）。
+
+任务：把这段对话翻译成若干条自足的陈述，并给这一段起标题和摘要。
+
+每条陈述必须满足：
+1. 无歧义   —— 不能出现"这个""那个""它"，除非上文明确指代过
+2. 指代明确 —— 代词必须替换成具体名词
+3. 去冗余   —— 同一个意思说三遍的，合并成一条
+4. 自足     —— 脱离上下文单独看，仍能看懂
+5. 保留原词 —— 专有名词、命令、路径、数字必须原样保留，不要意译
+
+不要总结成"用户表示赞同"这种没有信息量的话。
+如果用户的话很短（如"去做""可以""赞同"），必须从上一轮助手的提议中
+还原出他赞同的具体内容，写成完整陈述。
+
+条数由信息密度决定，不要凑数：
+- 出现新的决策 / 约束 / 实测数字 / 被否决的方案 → 各占一条
+- 纯执行性对话（"跑一下" → "跑完了，通过"）→ 0 条
+- 允许输出 0 条。宁可少，不要凑
+
+kind 取值：
+  decision    定下的方案
+  constraint  约束或限制
+  fact        实测数据
+  procedure   具体怎么做
+  rejected    试过不行 —— 这一类别最容易被漏掉，但对避免重复踩坑最有价值
+  question    尚未解决的问题
+  preference  用户偏好
+
+输出严格的 JSON，不要加任何解释文字：
+{
+  "title": "不超过 20 字，能作为检索键",
+  "digest": "不超过 120 字，说清这段在干什么、结论是什么",
+  "statements": [
+    {"text": "一条自足的陈述", "kind": "fact", "keywords": ["关键词"], "confidence": "explicit"}
+  ]
+}
+confidence 取 explicit（对话里明说）或 inferred（你推断出来的）。
+"""
+
+
+def _pi_auth_key():
+    """读 pi 已登录的 opencode-go 凭据（同一台机器、同一个用户）"""
+    try:
+        import json as _j
+        p = os.path.expanduser("~/.pi/agent/auth.json")
+        with open(p, "r", encoding="utf-8") as f:
+            return ((_j.load(f).get("opencode-go") or {}).get("key") or "")
+    except Exception:
+        return ""
+
+
+def _llm_chat(cfg, messages, max_tokens=3000):
+    import urllib.request
+    ep = (cfg.get("llm.endpoint") or "").strip().rstrip("/")
+    if not ep:
+        raise RuntimeError("llm.endpoint 未配置")
+    key = (cfg.get("llm.api_key") or "").strip() or _pi_auth_key()
+    if not key:
+        raise RuntimeError("没有可用的 api key（配 llm.api_key 或先登录 pi）")
+    body = {
+        "model": cfg.get("llm.model") or "deepseek-v4.1-flash",
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "stream": False,
+        # 这个模型默认带思考，会把 max_tokens 全烧在 reasoning 上，content 返回空
+        "thinking": {"type": "disabled"},
+    }
+    req = urllib.request.Request(ep + "/chat/completions",
+                                 data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + key,
+                                          "x-opencode-session": "pimem-l2",
+                                          # 不带 UA 会被 Cloudflare 拦成 1010 / 403
+                                          "User-Agent": "pimem/0.9"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=int(cfg.get("llm.timeout", 180))) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    return (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+
+
+def _seg_source_text(con, seg, max_chars=24000):
+    """从转录里取出段的原文：按 entry id 区间截取"""
+    path = seg["transcript"]
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    lines.append(json.loads(line))
+    except Exception:
+        return ""
+    ids, started = [], False
+    for e in lines:
+        if e.get("id") == seg["first_id"]:
+            started = True
+        if started:
+            ids.append(e)
+        if started and e.get("id") == seg["last_id"]:
+            break
+    if not ids:
+        ids = lines
+    out = []
+    for e in ids:
+        if e.get("type") != "message":
+            continue
+        m = e.get("message") or {}
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            t = c
+        elif isinstance(c, list):
+            t = "\n".join(b.get("text", "") for b in c
+                          if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            t = ""
+        t = (t or "").strip()
+        if t:
+            out.append("%s: %s" % (role, t))
+    text = "\n".join(out)
+    return text[-max_chars:]
+
+
+def _seg_enrich_one(con, cfg, seg, dry=False):
+    text = _seg_source_text(con, seg)
+    if len(text) < 80:
+        return {"id": seg["id"], "skipped": "source_too_short", "chars": len(text)}
+    raw = _llm_chat(cfg, [{"role": "system", "content": SEGMENT_PROMPT},
+                          {"role": "user", "content": text}])
+    # 抠 JSON
+    import re as _r
+    t = _r.sub(r"^```[a-zA-Z]*\s*", "", raw.strip())
+    t = _r.sub(r"\s*```$", "", t)
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j < 0:
+        return {"id": seg["id"], "error": "no_json", "raw": raw[:200]}
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception as e:
+        return {"id": seg["id"], "error": "bad_json", "detail": str(e)[:120], "raw": t[:200]}
+    title = str(d.get("title") or "").strip()[:40] or seg["title"]
+    digest = str(d.get("digest") or "").strip()[:300]
+    stmts = [s for s in (d.get("statements") or []) if isinstance(s, dict) and s.get("text")]
+    if dry:
+        return {"id": seg["id"], "title": title, "digest": digest,
+                "statements": stmts, "chars": len(text)}
+    # 向量用 title + digest + 所有陈述，检索面更大
+    vec = _seg_vec(title, digest + " " + " ".join(str(x.get("text")) for x in stmts))
+    con.execute("UPDATE mem_segments SET title=?,digest=?,statements=?,enriched=1,vector=?"
+                " WHERE id=?",
+                (title, digest, json.dumps(stmts, ensure_ascii=False), vec.tobytes(), seg["id"]))
+    con.commit()
+    return {"id": seg["id"], "title": title, "digest": digest, "statements": len(stmts)}
+
+
 # ---------------- 段跟踪与闭合 ----------------
 # 话题漂移检测：实测在短中文用户消息上不可用。
 # 12 轮真实对话里，真实话题边界（记忆→知识库）余弦 0.862，
@@ -1740,6 +1908,49 @@ def cmd_segment(a):
             except Exception as e:
                 text = "读取失败: %s" % e
         print(json.dumps({"segment": d, "text": text}, ensure_ascii=False, indent=2))
+        return
+
+    if sub == "finalize":
+        """会话结束：收口当前段 + 升级未 enriched 的段"""
+        cfg = load_config()
+        sid = a.session or ""
+        st = _seg_state(con, sid)
+        closed = None
+        if st:
+            closed = _seg_close(con, st, st["scope"], st["last_id"], st["turn_last"], "session_end")
+        segs = con.execute("SELECT * FROM mem_segments WHERE session_id=? AND enriched=0"
+                           " ORDER BY created_at LIMIT ?", (sid, int(a.limit or 20))).fetchall()
+        out = []
+        for seg in segs:
+            try:
+                out.append(_seg_enrich_one(con, cfg, seg, dry=bool(a.dry_run)))
+            except Exception as e:
+                out.append({"id": seg["id"], "error": str(e)[:160]})
+        print(json.dumps({"ok": True, "closed": closed, "enriched": len(out), "results": out},
+                         ensure_ascii=False, indent=2))
+        return
+
+    if sub == "enrich":
+        cfg = load_config()
+        q = "SELECT * FROM mem_segments WHERE enriched=0"
+        params = []
+        if a.session:
+            q += " AND session_id=?"
+            params.append(a.session)
+        q += " ORDER BY created_at LIMIT ?"
+        params.append(int(a.limit or 10))
+        segs = con.execute(q, params).fetchall()
+        if not segs:
+            print(json.dumps({"ok": True, "enriched": 0, "note": "没有待升级的段"},
+                             ensure_ascii=False)); return
+        out = []
+        for seg in segs:
+            try:
+                out.append(_seg_enrich_one(con, cfg, seg, dry=bool(a.dry_run)))
+            except Exception as e:
+                out.append({"id": seg["id"], "error": str(e)[:200]})
+        print(json.dumps({"ok": True, "total": len(segs), "results": out},
+                         ensure_ascii=False, indent=2))
         return
 
     if sub == "activate":
@@ -2617,6 +2828,14 @@ def main():
     sgl = sgs.add_parser("list"); sgl.add_argument("--scope", default=None); sgl.add_argument("--limit", type=int, default=30)
     sgg = sgs.add_parser("get"); sgg.add_argument("id"); sgg.add_argument("--part", default=None)
     sgc = sgs.add_parser("activate"); sgc.add_argument("--query", required=True); sgc.add_argument("-k", "--k", type=int, default=3)
+    sge = sgs.add_parser("enrich")
+    sge.add_argument("--session", default=None)
+    sge.add_argument("--limit", type=int, default=10)
+    sge.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgf = sgs.add_parser("finalize")
+    sgf.add_argument("--session", required=True)
+    sgf.add_argument("--limit", type=int, default=20)
+    sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
     sg.set_defaults(func=cmd_segment)
 
     s = sub.add_parser("ingest", parents=[common])

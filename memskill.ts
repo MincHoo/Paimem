@@ -552,6 +552,22 @@ export default function (pi: ExtensionAPI) {
 				await log({ t: Date.now(), event: "harvest_dump_error", err: String(e) });
 			}
 		}
+		// 段收口 + L2 升级：detached 跑，不阻塞退出
+		if (event.reason === "quit" || event.reason === "reload") {
+			try {
+				const sid2 = currentSid || "anon";
+				const child = spawn(pyBin, [MEM_PY, "segment", "finalize", "--session", sid2], {
+					detached: true,
+					stdio: "ignore",
+					windowsHide: true,
+					env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+				});
+				child.unref();
+				await log({ t: Date.now(), event: "segment_finalize_spawn", sid: sid2 });
+			} catch (e) {
+				await log({ t: Date.now(), event: "segment_finalize_error", err: String(e) });
+			}
+		}
 		if (event.reason === "reload" || event.reason === "quit") stopDaemon();
 		await log({ t: Date.now(), event: "shutdown", reason: event.reason });
 	});
