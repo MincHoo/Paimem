@@ -702,6 +702,19 @@ export default function (pi: ExtensionAPI) {
 		const lh = lastHarvest(entries);
 		let harvestReason = "";
 		if (harvestEnabled && pendingCompact) harvestReason = "压缩前";
+		// 第一轮：域激活（相关历史会话）
+		const doms = (out as any).domains as
+			| Array<{ id: string; scope: string; title: string; score: number }>
+			| null;
+		if (stats.turns === 0 && doms && doms.length) {
+			const list = doms.map((d) => `${d.id}「${d.title}」`).join("、");
+			const line =
+				`[mem:domains] 相关历史会话：${list}。` +
+				`需要细节用 python "${MEM_PY}" segment get <id>`;
+			tailText = tailText ? tailText + "\n\n" + line : line;
+
+		}
+
 		// 段闭合 → 把新段的指针追加到 tail（放 tail 不放 system：
 		// 段索引会话内会变几次，放 system 每次都是全量重算）
 		const seg = (out as any).segment as

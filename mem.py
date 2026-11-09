@@ -2633,6 +2633,44 @@ def _search_core(con, cfg, query, scope, top_n=30):
     return rank(cands, q_grams=q_grams, graph=graph)
 
 
+def _activate_domains(con, query, scope, k=3, min_score=0.5):
+    """用 query 找相关历史段，按域聚合。第一轮注入用。"""
+    qv = embed(["query: " + query])[0]
+    sql = ("SELECT id,scope,session_id,title,digest,vector,created_at,turn_start,turn_end"
+           " FROM mem_segments")
+    params = []
+    if scope and scope != "global":
+        sql += " WHERE scope IN (?, 'global')"
+        params.append(scope)
+    rows = con.execute(sql, params).fetchall()
+    if not rows:
+        return []
+    q_grams = ngrams(query)
+    raw = []
+    for r in rows:
+        v = np.frombuffer(r["vector"], dtype=np.float32)
+        raw.append((float(v @ qv),
+                    coverage(q_grams, (r["title"] or "") + " " + (r["digest"] or "")), r))
+    def norm(vals):
+        lo, hi = min(vals), max(vals)
+        span = hi - lo
+        return [(v - lo) / span if span > 1e-6 else 0.5 for v in vals]
+    ns = norm([x[0] for x in raw])
+    nk = norm([x[1] for x in raw])
+    scored = sorted(((0.65 * a1 + 0.35 * b1, x[2]) for a1, b1, x in zip(ns, nk, raw)),
+                    key=lambda t: -t[0])
+    out, seen = [], set()
+    for sc, r in scored:
+        if sc < min_score or len(out) >= k:
+            break
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        out.append({"id": r["id"], "scope": r["scope"], "title": r["title"],
+                    "score": round(sc, 3), "turns": [r["turn_start"], r["turn_end"]]})
+    return out
+
+
 def cmd_retrieve(a):
     """注入式检索：返回 stable/tail，不假设宿主怎么插"""
     cfg = load_config()
@@ -2656,6 +2694,14 @@ def cmd_retrieve(a):
     except Exception:
         pass
 
+    # 第一轮顺带做域激活：拿当前 query 找相关历史段，返回给宿主注入
+    domains = []
+    if (getattr(a, "turn", None) or 0) <= 1 and query:
+        try:
+            domains = _activate_domains(con, query, scope, k=3)
+        except Exception:
+            domains = []
+
     t0 = time.time()
     ranked = _search_core(con, cfg, query, scope, a.candidates)
     if not ranked:
@@ -2663,7 +2709,8 @@ def cmd_retrieve(a):
         print(json.dumps({"v": 1, "stable": {"text": "", "hash": "", "ids": []},
                           "tail": {"text": "", "ids": []},
                           "insert": {"system": "append", "afterUserText": "\n\n"},
-                          "debug": {"candidates": 0}}, ensure_ascii=False)); return
+                          "domains": domains,
+                          "segment": seg_info, "debug": {"candidates": 0}}, ensure_ascii=False)); return
 
     cache = "hit"
     if row is None or not row["stable_text"]:
@@ -2737,6 +2784,7 @@ def cmd_retrieve(a):
                  "anchor": bool(anchor_text), "dynamic": len(dyn)},
         "insert": {"system": "append", "afterUserText": "\n\n"},
         "segment": seg_info,
+        "domains": domains,
         "debug": {"candidates": len(ranked), "best": round(best, 4), "floor": round(floor, 4),
                   "drift": drift, "reanchors": reanchors, "elapsedMs": int(dt * 1000)},
     }, ensure_ascii=False, indent=2 if a.pretty else None))
