@@ -667,7 +667,12 @@ def score_base(row, sim, now, q_grams):
 # 铁律 3「self 源默认易腐」的系数。
 # 实测：×0.33 会让 AI 自己写的记忆几乎检索不到（20 题 Hit@3 60%）；
 # 去掉惩罚升到 85%，但会削弱防回音壁。取 0.8 折中，可用配置覆盖。
-DECAY_SELF_FACTOR = 0.8
+DECAY_SELF_FACTOR = 0.9
+
+# 短期激活：刚被检索过的记忆在接下来半小时内轻微提权，然后快速回落。
+# 目的：用户和模型专注一个话题时，同一批记忆反复出现，匹配度更高。
+ACTIVATION_BOOST = 0.15        # 最多 +15%
+ACTIVATION_HALFLIFE_MIN = 30   # 30 分钟减半
 
 
 def decay_factor(row, now):
@@ -680,6 +685,20 @@ def decay_factor(row, now):
         f *= DECAY_SELF_FACTOR
     f *= 0.70 + 0.30 * float(row["importance"] or 0.5)
     return f
+
+
+def activation_factor(row, now):
+    """刚被命中过的短期提权，30 分钟半衰；没有命中记录则不提权"""
+    try:
+        lh = row["last_hit"]
+    except Exception:
+        return 1.0
+    if not lh:
+        return 1.0
+    mins = (now - lh) / 60.0
+    if mins < 0:
+        return 1.0
+    return 1.0 + ACTIVATION_BOOST * math.exp(-math.log(2) * mins / ACTIVATION_HALFLIFE_MIN)
 
 
 def trust_factor(row):
@@ -763,7 +782,8 @@ def rank(cands, now=None, q_grams=None, graph=None):
     out = []
     for st in scored.values():
         r = st["row"]
-        total = st["base"] * decay_factor(r, now) * trust_factor(r)
+        total = (st["base"] * decay_factor(r, now) * trust_factor(r)
+                 * activation_factor(r, now))
         out.append((total, st.get("sim_raw", st["sim"]), r))
     out.sort(key=lambda x: -x[0])
     return out
