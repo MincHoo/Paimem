@@ -1748,7 +1748,50 @@ def _seg_enrich_one(con, cfg, seg, dry=False):
                 " WHERE id=?",
                 (title, digest, json.dumps(stmts, ensure_ascii=False), vec.tobytes(), seg["id"]))
     con.commit()
-    return {"id": seg["id"], "title": title, "digest": digest, "statements": len(stmts)}
+
+    # 只把 decision / rejected 提升成独立记忆：
+    # 这两类最怕忘（忘了就重复讨论、重复踩坑），数量也可控（每段 2-3 条）。
+    # fact 留在段里就够——搜数字时段的 digest 里也有。
+    promoted = _promote_statements(con, seg, stmts, cfg.get("llm.endpoint") or "")
+    return {"id": seg["id"], "title": title, "digest": digest,
+            "statements": len(stmts), "promoted": promoted}
+
+
+PROMOTE_KINDS = {"decision": ("decision", 0.70), "rejected": ("decision", 0.75)}
+PROMOTE_MAX = 4
+
+
+def _promote_statements(con, seg, stmts, endpoint=""):
+    """把 decision / rejected 陈述写成独立记忆，能被 mem_search 单独命中"""
+    import contextlib
+    out = []
+    for i, st in enumerate(stmts):
+        kind = str(st.get("kind") or "").lower()
+        if kind not in PROMOTE_KINDS:
+            continue
+        if len(out) >= PROMOTE_MAX:
+            break
+        text = str(st.get("text") or "").strip()
+        if len(text) < 8:
+            continue
+        claim_type, importance = PROMOTE_KINDS[kind]
+        ns = argparse.Namespace(
+            content=text, scope=seg["scope"], claim_type=claim_type,
+            origin="self", model="segment-l2", endpoint=endpoint,
+            evidence="tool:seg/%s/%d" % (seg["id"], i), reproduce=None,
+            force=True, quiet=True, actor="segment",
+            session=seg["session_id"], turn=None,
+            allow_instruction=False, no_dedup=False, assertion=None,
+            tags="seg," + kind, entities="", importance=importance,
+        )
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_add(ns)
+            out.append({"kind": kind, "text": text[:50]})
+        except Exception:
+            pass
+    return out
 
 
 # ---------------- 段跟踪与闭合 ----------------
@@ -1956,8 +1999,14 @@ def cmd_segment(a):
     if sub == "activate":
         """模拟会话开始时的域激活：用第一条用户消息检索所有段"""
         qv = embed(["query: " + a.query])[0]
-        rows = con.execute("SELECT id,scope,session_id,title,digest,vector,created_at,"
-                           "turn_start,turn_end,n_tok FROM mem_segments").fetchall()
+        # 默认只看同工作区（含 global），避免别的项目的段挤进来
+        sql = ("SELECT id,scope,session_id,title,digest,vector,created_at,"
+               "turn_start,turn_end,n_tok FROM mem_segments")
+        params = []
+        if getattr(a, "scope", None) and not getattr(a, "all_scopes", False):
+            sql += " WHERE scope IN (?, 'global')"
+            params.append(a.scope)
+        rows = con.execute(sql, params).fetchall()
         # 语义 + 关键词。纯余弦在 50 段规模下信号/噪声只差 0.01-0.03，
         # 中文专名（"英文维基" vs "中文维基"）只能靠词面区分。
         q_grams = ngrams(a.query)
@@ -2827,7 +2876,10 @@ def main():
     sga.add_argument("--errors", type=int, default=0)
     sgl = sgs.add_parser("list"); sgl.add_argument("--scope", default=None); sgl.add_argument("--limit", type=int, default=30)
     sgg = sgs.add_parser("get"); sgg.add_argument("id"); sgg.add_argument("--part", default=None)
-    sgc = sgs.add_parser("activate"); sgc.add_argument("--query", required=True); sgc.add_argument("-k", "--k", type=int, default=3)
+    sgc = sgs.add_parser("activate"); sgc.add_argument("--query", required=True)
+    sgc.add_argument("-k", "--k", type=int, default=3)
+    sgc.add_argument("--scope", default=None, help="只看该工作区（含 global）")
+    sgc.add_argument("--all", dest="all_scopes", action="store_true", help="跨所有工作区")
     sge = sgs.add_parser("enrich")
     sge.add_argument("--session", default=None)
     sge.add_argument("--limit", type=int, default=10)
