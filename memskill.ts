@@ -464,6 +464,12 @@ export default function (pi: ExtensionAPI) {
 		injectedIds = [];
 		pendingCompact = false;
 		lastSegTokens = 0;
+		try {
+			const e0 = ctx.sessionManager.getEntries();
+			lastSegTokens = Math.round(scanSession(e0).chars / CHARS_PER_TOKEN);
+		} catch {
+			/* ignore */
+		}
 		pendingInfo = null;
 		try {
 			if (existsSync(PENDING_PATH)) {
@@ -602,8 +608,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			return "";
 		})();
-		const turnTokens = Math.max(1, Math.round(segChars / CHARS_PER_TOKEN) - lastSegTokens);
-		lastSegTokens = Math.round(segChars / CHARS_PER_TOKEN);
+		// 首轮或热重载后 lastSegTokens 还是 0，直接相减会得到整个会话的 token 数，
+		// 瞬间触发段硬上限。这里封顶到 8000（单轮极少超过）。
+		const totalTokens = Math.round(segChars / CHARS_PER_TOKEN);
+		const turnTokens = Math.min(8000, Math.max(1, totalTokens - lastSegTokens));
+		lastSegTokens = totalTokens;
 
 		const args = (sc: string) => [
 			"retrieve",
