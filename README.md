@@ -166,6 +166,14 @@ model_class = "large"                  # unknown / small / medium / large
 **为什么按端点而不是按模型名**：模型自报不可信，同一端口后面换了模型系统感知不到。
 登记端点等于让换模型必须显式改配置。
 
+也可以直接用命令维护（写在 `~/.mem/trust.toml`，不动你手写的 `mem.toml`）：
+
+```bash
+python mem.py trust list
+python mem.py trust add "http://127.0.0.1:8080" --class large --note "本地 llama.cpp"
+python mem.py trust remove "http://127.0.0.1:8080"
+```
+
 ⚠️ 配置即信任：白名单防的是「无意降级」，不防恶意提权。远程端点请显式登记。
 
 ---

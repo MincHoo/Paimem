@@ -35,6 +35,7 @@ HOME = os.path.expanduser("~")
 BASE = os.environ.get("MEM_HOME", os.path.join(os.path.expanduser("~"), ".mem"))
 DB_PATH = os.environ.get("MEM_DB", os.path.join(BASE, "mem.db"))
 CFG_PATH = os.environ.get("MEM_CONFIG", os.path.join(BASE, "mem.toml"))
+TRUST_PATH = os.environ.get("MEM_TRUST", os.path.join(BASE, "trust.toml"))
 MODEL_DIR = os.environ.get("MEM_MODEL", os.path.join(BASE, "models", "e5-small-onnx"))
 ACTIVITY = os.path.join(BASE, "activity.log")
 
@@ -94,12 +95,23 @@ def load_config():
                 else:
                     cfg[prefix + k] = str(v)
         walk("", data)
-        # 端点白名单
+        # 端点白名单（mem.toml）
         for e in data.get("trust", {}).get("endpoints", []) or []:
             TRUST_ENDPOINTS.append((str(e.get("endpoint", "")).rstrip("/"),
                                     str(e.get("model_class", "unknown"))))
     except FileNotFoundError:
         pass
+    except Exception:
+        pass
+    # 端点白名单（trust.toml，由 mem.py trust 命令维护）
+    try:
+        import tomllib
+        with open(TRUST_PATH, "rb") as f:
+            td = tomllib.load(f)
+        for e in td.get("endpoints", []) or []:
+            ep = str(e.get("endpoint", "")).rstrip("/")
+            if ep:
+                TRUST_ENDPOINTS.append((ep, str(e.get("model_class", "unknown"))))
     except Exception:
         pass
     return cfg
@@ -1341,6 +1353,79 @@ def cmd_graph(a):
 
 
 # ---------------- 常驻服务 ----------------
+
+# ---------------- 端点白名单管理 ----------------
+def _read_trust_file():
+    try:
+        import tomllib
+        with open(TRUST_PATH, "rb") as f:
+            return tomllib.load(f).get("endpoints", []) or []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
+def _write_trust_file(entries):
+    lines = ["# 端点白名单（由 `mem.py trust` 维护，可手工编辑）",
+             "# model_class: unknown / small / medium / large", ""]
+    for e in entries:
+        lines.append("[[endpoints]]")
+        lines.append('endpoint = "%s"' % e.get("endpoint", ""))
+        lines.append('model_class = "%s"' % e.get("model_class", "unknown"))
+        if e.get("note"):
+            lines.append('note = "%s"' % e["note"])
+        lines.append("")
+    os.makedirs(os.path.dirname(TRUST_PATH) or ".", exist_ok=True)
+    with open(TRUST_PATH, "w", encoding="utf-8") as f:
+        f.write(chr(10).join(lines))
+
+
+def cmd_trust(a):
+    sub = getattr(a, "trust_cmd", "list")
+    entries = _read_trust_file()
+
+    if sub == "list":
+        load_config()   # 触发一次加载，保证 mem.toml 里的也在
+        rows = []
+        for prefix, cls in TRUST_ENDPOINTS:
+            src = "trust.toml" if any(e.get("endpoint", "").rstrip("/") == prefix
+                                      for e in entries) else "mem.toml"
+            rows.append({"endpoint": prefix, "model_class": cls, "source": src})
+        print(json.dumps({"endpoints": rows, "count": len(rows),
+                          "file": TRUST_PATH}, ensure_ascii=False, indent=2))
+        return
+
+    ep = (a.endpoint or "").rstrip("/")
+    if not ep:
+        print(json.dumps({"error": "need_endpoint"}, ensure_ascii=False)); return
+
+    if sub == "add":
+        cls = a.model_class
+        if cls not in ("unknown", "small", "medium", "large"):
+            print(json.dumps({"error": "bad_class", "allowed": ["unknown", "small", "medium", "large"]},
+                             ensure_ascii=False)); return
+        entries = [e for e in entries if e.get("endpoint", "").rstrip("/") != ep]
+        entries.append({"endpoint": ep, "model_class": cls, "note": a.note or ""})
+        _write_trust_file(entries)
+        print(json.dumps({"ok": True, "added": ep, "model_class": cls,
+                          "effect": "该端点下 origin=self 的写入将变为 active"
+                                    if cls in ("medium", "large") else "该端点下 origin=self 的写入仍为 draft"},
+                         ensure_ascii=False))
+        return
+
+    if sub == "remove":
+        before = len(entries)
+        entries = [e for e in entries if e.get("endpoint", "").rstrip("/") != ep]
+        if len(entries) == before:
+            print(json.dumps({"error": "not_found", "endpoint": ep}, ensure_ascii=False)); return
+        _write_trust_file(entries)
+        print(json.dumps({"ok": True, "removed": ep}, ensure_ascii=False))
+        return
+
+    print(json.dumps({"error": "unknown_subcommand", "got": sub}, ensure_ascii=False))
+
+
 def cmd_serve(a):
     """常驻 HTTP 服务：模型常驻内存，单次检索从 900ms 降到 ~50ms
 
@@ -1834,6 +1919,15 @@ def main():
     s.add_argument("--candidates", type=int, default=30)
     s.add_argument("--pretty", action="store_true")
     s.set_defaults(func=cmd_snapshot)
+
+    t = sub.add_parser("trust", parents=[common])
+    tsub = t.add_subparsers(dest="trust_cmd")
+    tsub.add_parser("list")
+    ta = tsub.add_parser("add"); ta.add_argument("endpoint")
+    ta.add_argument("--class", dest="model_class", default="unknown")
+    ta.add_argument("--note", default="")
+    tr = tsub.add_parser("remove"); tr.add_argument("endpoint")
+    t.set_defaults(func=cmd_trust)
 
     s = sub.add_parser("serve", parents=[common])
     s.add_argument("--port", type=int, default=7788)
