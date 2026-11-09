@@ -141,6 +141,8 @@ let injectedIds: string[] = [];
 let pendingCompact = false;
 /** 上一轮累计 token，用来算本轮增量（段硬上限用） */
 let lastSegTokens = 0;
+/** 会话开始后的第一轮不计 token，避免基线对不齐 */
+let firstTurnAfterStart = true;
 let skillHidden = false;
 /** 上次会话遗留的未总结信息（开窗时读，第一轮消费后删除） */
 let pendingInfo: { turns: number; tokens: number; ts: number } | null = null;
@@ -464,6 +466,7 @@ export default function (pi: ExtensionAPI) {
 		injectedIds = [];
 		pendingCompact = false;
 		lastSegTokens = 0;
+		firstTurnAfterStart = true;
 		try {
 			const e0 = ctx.sessionManager.getEntries();
 			lastSegTokens = Math.round(scanSession(e0).chars / CHARS_PER_TOKEN);
@@ -608,10 +611,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			return "";
 		})();
-		// 首轮或热重载后 lastSegTokens 还是 0，直接相减会得到整个会话的 token 数，
-		// 瞬间触发段硬上限。这里封顶到 8000（单轮极少超过）。
+		// 热重载 / 恢复会话后的第一轮，lastSegTokens 和实际总量对不齐，
+		// 相减会得到整个会话的 token 数，瞬间触发段硬上限。
+		// 所以第一轮不计入，从第二轮开始用真实增量。
 		const totalTokens = Math.round(segChars / CHARS_PER_TOKEN);
-		const turnTokens = Math.min(8000, Math.max(1, totalTokens - lastSegTokens));
+		const delta = totalTokens - lastSegTokens;
+		const turnTokens = firstTurnAfterStart ? 0 : Math.min(6000, Math.max(1, delta));
+		firstTurnAfterStart = false;
 		lastSegTokens = totalTokens;
 
 		const args = (sc: string) => [
