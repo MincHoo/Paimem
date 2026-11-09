@@ -739,6 +739,15 @@ def cmd_search(a):
 
 def cmd_get(a):
     con = db(); init_db(con)
+    ids = [x for x in (getattr(a, "ids", "") or "").split(",") if x]
+    if ids:
+        out = []
+        for i in ids:
+            r = con.execute("SELECT * FROM mem_items WHERE id=?", (i,)).fetchone()
+            if r:
+                out.append({k: r[k] for k in r.keys() if k != "vector"})
+        print(json.dumps({"items": out, "count": len(out)}, ensure_ascii=False, indent=2))
+        return
     r = con.execute("SELECT * FROM mem_items WHERE id=?", (a.id,)).fetchone()
     if not r:
         print(json.dumps({"error": "not_found", "id": a.id}, ensure_ascii=False)); return
@@ -1175,6 +1184,8 @@ def cmd_serve(a):
                         origin=b.get("origin", "self"), endpoint=b.get("endpoint", ""),
                         evidence=b.get("evidence", ""), tags=b.get("tags", ""),
                         verified=int(b.get("verified", 0)))
+        if path == "/get":
+            return call(cmd_get, id="", ids=",".join(b.get("ids") or []))
         if path == "/snapshot":
             return call(cmd_snapshot, session=b.get("session", ""), query=b.get("query", ""),
                         scope=b.get("scope"))
@@ -1554,7 +1565,10 @@ def main():
     s.add_argument("--pretty", action="store_true")
     s.set_defaults(func=cmd_search)
 
-    s = sub.add_parser("get", parents=[common]); s.add_argument("id"); s.set_defaults(func=cmd_get)
+    s = sub.add_parser("get", parents=[common])
+    s.add_argument("id", nargs="?", default="")
+    s.add_argument("--ids", default="", help="逗号分隔批量取")
+    s.set_defaults(func=cmd_get)
     s = sub.add_parser("reinforce", parents=[common]); s.add_argument("id"); s.set_defaults(func=cmd_reinforce)
 
     s = sub.add_parser("supersede", parents=[common])

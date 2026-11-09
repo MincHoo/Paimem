@@ -27,7 +27,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { appendFile, mkdir } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,8 @@ const BASE = `http://127.0.0.1:${PORT}`;
 
 const MEM_HOME = process.env.MEM_HOME ?? join(homedir(), ".mem");
 const LOG_PATH = join(MEM_HOME, "pi-adapter.log");
+/** 上次会话没总结的标记 */
+const PENDING_PATH = join(MEM_HOME, "pending.json");
 
 // ---- 触发阈值（实测：本会话 123 轮 / 453K token / 平均 3.7K 每轮）----
 const TOKENS_FIRST = Number(process.env.MEM_TOKENS_FIRST ?? 60_000);
@@ -136,6 +138,8 @@ let scope = process.env.MEM_SCOPE ?? "default";
 let injectedIds: string[] = [];
 let pendingCompact = false;
 let skillHidden = false;
+/** 上次会话遗留的未总结信息（开窗时读，第一轮消费后删除） */
+let pendingInfo: { turns: number; tokens: number; ts: number } | null = null;
 
 // ---- 常驻服务 ----
 let daemon: ChildProcess | null = null;
@@ -330,11 +334,16 @@ function lastHarvest(entries: any[]): { turn: number; tokens: number } {
 	return { turn: 0, tokens: 0 };
 }
 
-function harvestLine(turn: number, tokensK: number, reason: string): string {
-	const cmd =
+function harvestCmd(): string {
+	return (
 		`python "${MEM_PY}" add "<一句话事实>" --scope ${scope} --origin self` +
 		(ENDPOINT ? ` --endpoint ${ENDPOINT}` : "") +
-		` --claim-type <fact|preference|decision|procedure|observation>`;
+		` --claim-type <fact|preference|decision|procedure|observation>`
+	);
+}
+
+function harvestLine(turn: number, tokensK: number, reason: string): string {
+	const cmd = harvestCmd();
 	return (
 		`[mem:harvest] 第 ${turn} 轮 / 约 ${tokensK}K token（${reason}）。` +
 		`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${cmd}` +
@@ -368,6 +377,16 @@ export default function (pi: ExtensionAPI) {
 		stats.viaSpawn = 0;
 		injectedIds = [];
 		pendingCompact = false;
+		pendingInfo = null;
+		try {
+			if (existsSync(PENDING_PATH)) {
+				const p = JSON.parse(readFileSync(PENDING_PATH, "utf8"));
+				if (p && Date.now() - (p.ts ?? 0) < 7 * 86400_000) pendingInfo = p;
+				else unlinkSync(PENDING_PATH);
+			}
+		} catch {
+			/* ignore */
+		}
 		const cwd = ctx.sessionManager.getCwd?.() ?? process.cwd();
 		const cfg = loadConfig(cwd);
 		if (cfg.enabled === false) enabled = false;
@@ -379,7 +398,25 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// 插件退出 / 重载 / 切会话 → 关掉服务
-	pi.on("session_shutdown", async (event) => {
+	pi.on("session_shutdown", async (event, ctx) => {
+		// 关窗时若还有没总结的量 → 留标记给下次会话（不阻塞、不调模型）
+		if (event.reason === "quit" && harvestEnabled) {
+			try {
+				const entries = ctx.sessionManager.getEntries();
+				const { turns, chars } = scanSession(entries);
+				const tokens = Math.round(chars / CHARS_PER_TOKEN);
+				const lh = lastHarvest(entries);
+				if (turns > 0 && tokens - lh.tokens >= TURNS_MIN_TOKENS && turns - lh.turn >= 3) {
+					writeFileSync(
+						PENDING_PATH,
+						JSON.stringify({ turns, tokens, ts: Date.now() }),
+						"utf8",
+					);
+				}
+			} catch {
+				/* ignore */
+			}
+		}
 		if (event.reason === "reload" || event.reason === "quit") stopDaemon();
 		await log({ t: Date.now(), event: "shutdown", reason: event.reason });
 	});
@@ -493,6 +530,20 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		// 上次会话没总结 → 本轮补一句提醒
+		if (pendingInfo && stats.turns === 1) {
+			const line =
+				`[mem:harvest] 上次会话（${pendingInfo.turns} 轮 / 约 ${Math.round(pendingInfo.tokens / 1000)}K token）没总结。` +
+				`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${harvestCmd()}`;
+			tailText = tailText ? tailText + "\n\n" + line : line;
+			try {
+				unlinkSync(PENDING_PATH);
+			} catch {
+				/* ignore */
+			}
+			pendingInfo = null;
+		}
+
 		const willInject = Boolean(tailText) && tailText !== stats.lastTail;
 		const tailBytes = willInject ? Buffer.byteLength(tailText, "utf8") : 0;
 		if (willInject) {
@@ -552,26 +603,82 @@ export default function (pi: ExtensionAPI) {
 			type: "object",
 			properties: {
 				query: { type: "string", description: "检索语句，用自然语言" },
-				k: { type: "number", description: "返回条数，默认 5" },
+				k: { type: "number", description: "返回条数，默认 5；>=8 时只返回摘要索引" },
+				detail: { type: "boolean", description: "true = 强制返回全文" },
 			},
 			required: ["query"],
 		} as any,
 		async execute(_id: string, params: any) {
 			const k = Math.max(1, Math.min(Number(params.k) || 5, 20));
-			const r = await runMem(
+			const detail = params.detail === true || k < 8; // k>=8 默认只给索引
+			let r = await runMem(
 				["search", String(params.query), "--scope", scope, "-k", String(k)],
 				"/search",
 				{ query: String(params.query), scope, k },
 			);
+			// 本项目还没有记忆 → 回退到全局
+			if (r && (r.results ?? []).length === 0 && FALLBACK_SCOPE && FALLBACK_SCOPE !== scope) {
+				r = await runMem(
+					["search", String(params.query), "--scope", FALLBACK_SCOPE, "-k", String(k)],
+					"/search",
+					{ query: String(params.query), scope: FALLBACK_SCOPE, k },
+				);
+			}
 			if (!r) {
 				return { content: [{ type: "text", text: "记忆库不可用" }], details: {} };
 			}
-			const items = (r.results ?? []).map(
-				(x: any, i: number) =>
-					`${i + 1}. [${x.id}] (${x.claim_type}, ${Number(x.score).toFixed(2)}) ${x.content}`,
-			);
+			const rows = r.results ?? [];
+			const items = rows.map((x: any, i: number) => {
+				const head = `${i + 1}. [${x.id}] (${x.claim_type}, ${Number(x.score).toFixed(2)})`;
+				if (detail) return `${head} ${x.content}`;
+				const brief = String(x.content).replace(/\s+/g, " ").slice(0, 70);
+				return `${head} ${brief}${String(x.content).length > 70 ? "…" : ""}`;
+			});
+			const hint =
+				!detail && rows.length
+					? `\n\n（共 ${rows.length} 条，只显示摘要。需要全文用 mem_fetch(["id1","id2"])）`
+					: "";
 			return {
-				content: [{ type: "text", text: items.length ? items.join("\n") : "没有匹配的记忆" }],
+				content: [
+					{ type: "text", text: items.length ? items.join("\n") + hint : "没有匹配的记忆" },
+				],
+				details: { count: items.length, brief: !detail },
+			};
+		},
+	});
+
+	// 第二层：按 id 取全文
+	pi.registerTool({
+		name: "mem_fetch",
+		label: "记忆取全文",
+		description:
+			"按 id 批量取记忆全文。先用 mem_search 拿索引，挑出真正需要的 id 再调这个，避免一次拉回大量文本。",
+		parameters: {
+			type: "object",
+			properties: {
+				ids: { type: "array", items: { type: "string" }, description: "记忆 id 列表" },
+			},
+			required: ["ids"],
+		} as any,
+		async execute(_id: string, params: any) {
+			const ids = (Array.isArray(params.ids) ? params.ids : [params.ids])
+				.filter(Boolean)
+				.slice(0, 10);
+			if (!ids.length) {
+				return { content: [{ type: "text", text: "没有提供 id" }], details: {} };
+			}
+			const r = await runMem(["get", "--ids", ids.join(",")], "/get", { ids });
+			const items = r?.items ?? [];
+			const text = items
+				.map(
+					(x: any) =>
+						`[${x.id}] (${x.claim_type}, verified=${x.verified}, scope=${x.scope})\n${x.content}` +
+						(x.evidence_ref ? `\n  证据: ${x.evidence_ref}` : "") +
+						(x.tags ? `\n  tags: ${x.tags}` : ""),
+				)
+				.join("\n\n");
+			return {
+				content: [{ type: "text", text: text || "没有找到这些 id" }],
 				details: { count: items.length },
 			};
 		},
