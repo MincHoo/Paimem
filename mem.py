@@ -249,7 +249,11 @@ def db():
     cols = [r[1] for r in con.execute("PRAGMA table_info(mem_items)").fetchall()]
     if cols and "reproduce" not in cols:
         con.execute("ALTER TABLE mem_items ADD COLUMN reproduce TEXT")
-        con.commit()
+    if cols and "session_id" not in cols:
+        con.execute("ALTER TABLE mem_items ADD COLUMN session_id TEXT")
+    if cols and "turn_idx" not in cols:
+        con.execute("ALTER TABLE mem_items ADD COLUMN turn_idx INTEGER")
+    con.commit()
     return con
 
 
@@ -292,6 +296,24 @@ def resolve_trust(endpoint):
         if ep.startswith(prefix):
             return cls, True
     return "unknown", False
+
+
+# 铁律 6 的第二道闸：写入时就识别"看起来像指令"的内容。
+# 召回端已有 data 声明，这里再拦一次，防止记忆变成持久化的提示注入载体。
+INSTRUCTION_PATTERNS = [
+    "忽略之前", "忽略以上", "忽略前面", "无视之前", "忘掉之前",
+    "ignore previous", "ignore all previous", "disregard previous",
+    "你现在是", "从现在起你是", "you are now", "act as",
+    "系统提示词", "system prompt", "开发者消息", "developer message",
+    "执行以下命令", "run the following", "请执行", "立即执行",
+    "不要告诉用户", "do not tell the user", "不要提示用户",
+    "rm -rf /", "format c:", "del /f /s /q",
+]
+
+
+def looks_like_instruction(text):
+    t = str(text or "").lower()
+    return [p for p in INSTRUCTION_PATTERNS if p in t]
 
 
 def decide_status_and_verified(origin, model_class, declared, want_verified, has_evidence):
@@ -391,6 +413,12 @@ def cmd_add(a):
     if a.origin == "self" and not has_ev:
         verified = 0
 
+    hits = looks_like_instruction(content)
+    if hits and not getattr(a, "allow_instruction", False):
+        status = "draft"          # 强制降级，不拒绝（可能是引用而非真指令）
+        verified = 0
+        a.tags = (a.tags + ",疑似指令").strip(",")
+
     vec = embed(["passage: " + content])[0]
     now = int(time.time())
 
@@ -428,9 +456,10 @@ def cmd_add(a):
                             (best_id,)).fetchone()
         if (old_v and old_v["status"] == "active"
                 and old_v["claim_type"] == "fact" and a.claim_type == "fact"):
-            diff_v = int(old_v["verified"] or 0) != verified
+            # 置信度差异本身不是矛盾（v1 -> v2 是"被证实"，不是"被推翻"）
             contra = looks_contradictory(old_v["content"], content)
-            if diff_v or contra:
+            num = numeric_conflict(old_v["content"], content)
+            if contra or num:
                 conflict_with = best_id
 
     mid = "mem-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
@@ -439,14 +468,36 @@ def cmd_add(a):
     nt = n_tokens(content)
     con.execute("""INSERT INTO mem_items(id,content,assertion,claim_type,origin,origin_model,
         origin_endpoint,verified,evidence_ref,verified_at,scope,tags,entities,importance,n_tok,
-        created_at,valid_from,status,hot_score,hit_count,last_hit,cold,vector,reproduce)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        created_at,valid_from,status,hot_score,hit_count,last_hit,cold,vector,reproduce,
+        session_id,turn_idx)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (mid, content, a.assertion, a.claim_type, a.origin, a.model, a.endpoint,
          verified, a.evidence, now if has_ev else None, a.scope, a.tags, a.entities,
-         a.importance, nt, now, now, status, 1.0, 0, now, 0, vec.tobytes(), a.reproduce))
+         a.importance, nt, now, now, status, 1.0, 0, now, 0, vec.tobytes(), a.reproduce,
+         getattr(a, "session", None), getattr(a, "turn", None)))
     if conflict_with:
         con.execute("INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at) VALUES(?,?,?,?,?)",
                     (mid, conflict_with, "contradicts", 1.0, now))
+
+    # confirmed_by：工具实证（verified=2）落地时，回头确认同 scope 里
+    # 低置信的旧断言。这是唯一不需要 LLM 就能建出来的"类型边"。
+    if verified >= 2:
+        try:
+            old = con.execute(
+                "SELECT id, vector FROM mem_items WHERE scope=? AND status='active' "
+                "AND verified < 2 AND id != ?", (a.scope, mid)).fetchall()
+            if old:
+                ov = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in old])
+                sims = ov @ vec
+                for i in np.argsort(-sims)[:3]:
+                    if float(sims[i]) < 0.90:
+                        break
+                    con.execute(
+                        "INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (mid, old[i]["id"], "confirmed_by", round(float(sims[i]), 4), now))
+        except Exception:
+            pass
     log_event(con, "add", mid, a.actor, {"status": status, "verified": verified,
                                          "endpoint": a.endpoint, "model_class": model_class})
     con.commit()
@@ -455,6 +506,7 @@ def cmd_add(a):
     say(f"🧠 记忆 +1  scope={a.scope}  status={status}  verified={verified}", a.quiet)
     print(json.dumps({"ok": True, "action": "add", "id": mid, "status": status,
                       "verified": verified, "model_class": model_class,
+                      "suspicious": bool(hits) or None,
                       "declared": declared}, ensure_ascii=False))
 
 
@@ -1146,7 +1198,9 @@ def cmd_graph(a):
             keep.add(k)
 
     now = int(time.time())
-    con.execute("DELETE FROM mem_edges WHERE src_id IN (%s)" % ",".join("?" * len(ids)), ids)
+    con.execute("DELETE FROM mem_edges WHERE src_id IN (%s) "
+                "AND etype IN ('related','near_dup','contradicts')"
+                % ",".join("?" * len(ids)), ids)
     edges = []
     for k in sorted(keep):
         u, v, et, w = cand[k]
@@ -1590,6 +1644,10 @@ def main():
     s.add_argument("--evidence", default=None)
     s.add_argument("--reproduce", default=None, help="可复现的命令或路径（只存不执行）")
     s.add_argument("--force", action="store_true", help="绕过写入配额（批量/测试用）")
+    s.add_argument("--session", default=None, help="来源会话 id（用于时序边）")
+    s.add_argument("--turn", type=int, default=None, help="来源会话的第几轮")
+    s.add_argument("--allow-instruction", dest="allow_instruction", action="store_true",
+                   help="允许写入疑似指令内容（默认降级为 draft）")
     s.add_argument("--no-dedup", dest="no_dedup", action="store_true",
                    help="跳过相似度去重（更正旧记忆时用，否则会被并进旧条目）")
     s.add_argument("--assertion", default=None)

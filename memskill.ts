@@ -140,6 +140,8 @@ let pendingCompact = false;
 let skillHidden = false;
 /** 上次会话遗留的未总结信息（开窗时读，第一轮消费后删除） */
 let pendingInfo: { turns: number; tokens: number; ts: number } | null = null;
+/** 当前会话 id，供 harvest 命令带上 --session */
+let currentSid = "";
 
 // ---- 常驻服务 ----
 let daemon: ChildProcess | null = null;
@@ -334,16 +336,17 @@ function lastHarvest(entries: any[]): { turn: number; tokens: number } {
 	return { turn: 0, tokens: 0 };
 }
 
-function harvestCmd(): string {
+function harvestCmd(sid?: string): string {
 	return (
 		`python "${MEM_PY}" add "<一句话事实>" --scope ${scope} --origin self` +
 		(ENDPOINT ? ` --endpoint ${ENDPOINT}` : "") +
+		(sid ? ` --session ${sid}` : "") +
 		` --claim-type <fact|preference|decision|procedure|observation>`
 	);
 }
 
 function harvestLine(turn: number, tokensK: number, reason: string): string {
-	const cmd = harvestCmd();
+	const cmd = harvestCmd(currentSid);
 	return (
 		`[mem:harvest] 第 ${turn} 轮 / 约 ${tokensK}K token（${reason}）。` +
 		`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${cmd}` +
@@ -439,6 +442,7 @@ export default function (pi: ExtensionAPI) {
 		if (!query) return;
 
 		const sid = ctx.sessionManager.getSessionId();
+		currentSid = sid;
 		const args = (sc: string) => [
 			"retrieve",
 			"--session",
@@ -534,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 		if (pendingInfo && stats.turns === 1) {
 			const line =
 				`[mem:harvest] 上次会话（${pendingInfo.turns} 轮 / 约 ${Math.round(pendingInfo.tokens / 1000)}K token）没总结。` +
-				`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${harvestCmd()}`;
+				`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${harvestCmd(currentSid)}`;
 			tailText = tailText ? tailText + "\n\n" + line : line;
 			try {
 				unlinkSync(PENDING_PATH);
