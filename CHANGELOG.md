@@ -18,6 +18,13 @@
 - 心跳超 5 分钟的 `running` 视为僵死，会被重新捡起（attempts 递增）
 - 提取结果落 `draft`，不进检索，可 `promote`
 
+### 会话段索引（C1）
+- `mem_segments` 表：标题 / 摘要 / 指针（transcript + entry id 区间）/ 向量
+- 按硬上限切段（15 轮或 12K token），不按话题漂移（实测不可用）
+- `continues` 边：同域新段自动接上一段，形成会话链
+- `segment list / get / activate`；activate 用 语义 0.65 + 关键词 0.35
+- 段闭合时把指针追加到 tail（不放 system，避免全量重算）
+
 ### 会话锚点
 - 每会话开始写一条，落 DB（`mem_anchors`）+ pi 自定义条目
 - 记录会话 id / scope / cwd / 上一个会话 / 遗留候选数

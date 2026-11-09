@@ -83,6 +83,9 @@ DEFAULTS = {
     "harvest.max_per_session": "5",
     "harvest.sim_skip": "0.90",
     "harvest.stale_min": "5",
+    "segment.drift_threshold": "0",
+    "segment.max_turns": "15",
+    "segment.max_tokens": "12000",
 }
 
 CLAIM_HALFLIFE = {"fact": 35, "preference": 180, "decision": 90,
@@ -211,6 +214,23 @@ CREATE TABLE IF NOT EXISTS mem_sessions(
   anchor_text TEXT, anchor_ids TEXT,
   drift INTEGER DEFAULT 0, reanchors INTEGER DEFAULT 0,
   last_query TEXT, created_at INTEGER, updated_at INTEGER
+);
+
+-- 段跟踪状态：每个会话当前打开的段（话题漂移检测用）
+CREATE TABLE IF NOT EXISTS mem_segment_state(
+  session_id TEXT PRIMARY KEY,
+  scope TEXT,
+  seq INTEGER DEFAULT 1,
+  centroid BLOB,            -- 段内用户消息向量的运行均值
+  first_text TEXT,
+  last_text TEXT,
+  first_id TEXT,
+  last_id TEXT,
+  turn_start INTEGER,
+  turn_last INTEGER,
+  n_turns INTEGER DEFAULT 0,
+  n_tok INTEGER DEFAULT 0,
+  opened_at INTEGER
 );
 
 -- 会话段索引：摘要 + 指向磁盘原文的指针（不折叠上下文，只做旁路记录）
@@ -379,6 +399,9 @@ def apply_tunables(cfg):
     num("harvest.max_per_session", "HARVEST_MAX_PER_SESSION", int)
     num("harvest.sim_skip", "HARVEST_SIM_SKIP")
     num("harvest.stale_min", "HARVEST_STALE_MIN", int)
+    num("segment.drift_threshold", "SEG_DRIFT")
+    num("segment.max_turns", "SEG_MAX_TURNS", int)
+    num("segment.max_tokens", "SEG_MAX_TOKENS", int)
 
 
 def init_db(con):
@@ -1559,6 +1582,106 @@ def cmd_ingest(a):
 
 
 
+
+# ---------------- 段跟踪与闭合 ----------------
+# 话题漂移检测：实测在短中文用户消息上不可用。
+# 12 轮真实对话里，真实话题边界（记忆→知识库）余弦 0.862，
+# 而同话题内部最低到 0.827 —— 信号完全被噪声淹没。
+# 2-gram 重叠也几乎全为 0。所以默认关闭，只靠硬上限切段。
+# 想启用就把它调到 0.80 以下，并自己实测。
+SEG_DRIFT = 0.0           # 0 = 关闭漂移检测
+SEG_MAX_TURNS = 15        # 硬上限：段内最多多少轮
+SEG_MAX_TOKENS = 12000    # 硬上限：段内最多多少 token
+SEG_TITLE_CHARS = 40
+SEG_DIGEST_CHARS = 200
+
+
+def _seg_state(con, sid):
+    return con.execute("SELECT * FROM mem_segment_state WHERE session_id=?", (sid,)).fetchone()
+
+
+def _seg_open(con, sid, scope, text, turn, entry_id, vec, tok=0):
+    con.execute(
+        "INSERT OR REPLACE INTO mem_segment_state(session_id,scope,seq,centroid,first_text,"
+        "last_text,first_id,last_id,turn_start,turn_last,n_turns,n_tok,opened_at)"
+        " VALUES(?,?,1,?,?,?,?,?,?,?,1,?,?)",
+        (sid, scope, vec.tobytes(), text, text, entry_id or "", entry_id or "",
+         turn or 0, turn or 0, max(tok, n_tokens(text)), int(time.time())))
+    con.commit()
+
+
+def _seg_close(con, st, scope, last_id, turn_last, reason):
+    """把当前段落成一条 mem_segments，并和同域上一段建 continues 边"""
+    first_text = st["first_text"] or ""
+    last_text = st["last_text"] or ""
+    title = first_text[:SEG_TITLE_CHARS].strip() or "(未命名段)"
+    # 摘要用首尾两条用户消息：只取首条会丢掉后半段的话题
+    if last_text and last_text != first_text:
+        digest = (first_text + " … " + last_text)[:SEG_DIGEST_CHARS]
+    else:
+        digest = first_text[:SEG_DIGEST_CHARS]
+    seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
+    vec = _seg_vec(title, digest)
+    con.execute(
+        "INSERT INTO mem_segments(id,scope,session_id,seq,title,digest,transcript,"
+        "first_id,last_id,turn_start,turn_end,n_tok,files,cmds,errors,vector,created_at)"
+        " VALUES(?,?,?,?,?,?,'',?,?,?,?,?,'[]','[]',0,?,?)",
+        (seg_id, scope, st["session_id"], st["seq"], title, digest,
+         st["first_id"] or "", last_id or st["last_id"] or "",
+         st["turn_start"] or 0, turn_last or st["turn_last"] or 0,
+         st["n_tok"] or 0, vec.tobytes(), int(time.time())))
+    # 会话链：同域里最近的一条段 → 本段
+    prev = con.execute(
+        "SELECT id FROM mem_segments WHERE scope=? AND id<>? ORDER BY created_at DESC LIMIT 1",
+        (scope, seg_id)).fetchone()
+    if prev:
+        con.execute("INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at) VALUES(?,?,?,?,?)",
+                    (prev["id"], seg_id, "continues", 1.0, int(time.time())))
+    con.execute("DELETE FROM mem_segment_state WHERE session_id=?", (st["session_id"],))
+    con.commit()
+    return {"id": seg_id, "title": title, "digest": digest,
+            "turns": [st["turn_start"], turn_last], "n_tok": st["n_tok"],
+            "reason": reason, "prev": prev["id"] if prev else None}
+
+
+def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0):
+    """每轮调一次：更新段状态，必要时闭合旧段并开新段"""
+    if not text or not sid:
+        return None
+    vec = embed(["query: " + text])[0]
+    st = _seg_state(con, sid)
+    if not st:
+        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens)
+        return {"action": "open", "seq": 1, "drift": 1.0}
+
+    centroid = np.frombuffer(st["centroid"], dtype=np.float32)
+    sim = float(centroid @ vec)
+    n_turns = (st["n_turns"] or 0) + 1
+    n_tok = (st["n_tok"] or 0) + max(turn_tokens, n_tokens(text))
+
+    drift = bool(SEG_DRIFT) and sim < SEG_DRIFT
+    capped = n_turns > SEG_MAX_TURNS or n_tok > SEG_MAX_TOKENS
+
+    if drift or capped:
+        closed = _seg_close(con, st, scope, entry_id, turn,
+                            "drift" if drift else "cap")
+        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens)
+        return {"action": "close", "closed": closed, "drift": round(sim, 3),
+                "new_seq": 1}
+
+    # 运行均值
+    k = st["n_turns"] or 1
+    newc = centroid * (k / (k + 1.0)) + vec * (1.0 / (k + 1.0))
+    n = float(np.linalg.norm(newc)) or 1.0
+    newc = newc / n
+    con.execute("UPDATE mem_segment_state SET centroid=?,last_text=?,last_id=?,turn_last=?,"
+                "n_turns=?,n_tok=? WHERE session_id=?",
+                (newc.astype(np.float32).tobytes(), text, entry_id or st["last_id"],
+                 turn or st["turn_last"], n_turns, n_tok, sid))
+    con.commit()
+    return {"action": "continue", "seq": st["seq"], "drift": round(sim, 3)}
+
+
 # ---------------- 会话段索引（C1：摘要 + 指针，不折叠） ----------------
 def _seg_vec(title, digest):
     return embed(["passage: " + (title or "") + "。" + (digest or "")])[0]
@@ -1970,7 +2093,7 @@ def cmd_serve(a):
 
     仅监听 127.0.0.1。接口：
       GET  /health
-      POST /retrieve {session,query,scope,exclude_ids,candidates}
+      POST /retrieve {session,query,scope,exclude_ids,candidates,turn,entry_id,turn_tokens}
       POST /search   {query,scope,k,include_cold,include_drafts}
       POST /add      {content,scope,origin,claim_type,endpoint,evidence,tags}
       POST /snapshot {session,query,scope}
@@ -2007,6 +2130,8 @@ def cmd_serve(a):
         if path == "/retrieve":
             return call(cmd_retrieve, session=b.get("session", ""), query=b.get("query", ""),
                         scope=b.get("scope"), candidates=int(b.get("candidates", 30)),
+                        turn=b.get("turn"), entry_id=b.get("entry_id"),
+                        turn_tokens=int(b.get("turn_tokens", 0) or 0),
                         exclude_ids=",".join(b.get("exclude_ids") or []))
         if path == "/search":
             return call(cmd_search, query=b.get("query", ""), scope=b.get("scope"),
@@ -2262,6 +2387,15 @@ def cmd_retrieve(a):
     row = get_session(con, sid)
     scope = a.scope or (row["scope"] if row else "")
 
+    # 段跟踪（话题漂移检测），结果随 retrieve 一起返回，不额外往返
+    seg_info = None
+    try:
+        seg_info = track_segment(con, sid, scope, query,
+                                 getattr(a, "turn", None), getattr(a, "entry_id", None),
+                                 getattr(a, "turn_tokens", 0) or 0)
+    except Exception:
+        pass
+
     t0 = time.time()
     ranked = _search_core(con, cfg, query, scope, a.candidates)
     if not ranked:
@@ -2342,6 +2476,7 @@ def cmd_retrieve(a):
         "tail": {"text": tail_text, "ids": tail_ids,
                  "anchor": bool(anchor_text), "dynamic": len(dyn)},
         "insert": {"system": "append", "afterUserText": "\n\n"},
+        "segment": seg_info,
         "debug": {"candidates": len(ranked), "best": round(best, 4), "floor": round(floor, 4),
                   "drift": drift, "reanchors": reanchors, "elapsedMs": int(dt * 1000)},
     }, ensure_ascii=False, indent=2 if a.pretty else None))
@@ -2449,6 +2584,10 @@ def main():
     s.add_argument("--force", action="store_true")
     s.add_argument("--pretty", action="store_true")
     s.add_argument("--exclude-ids", default="", help="逗号分隔，排除最近已注入的 id")
+    s.add_argument("--turn", type=int, default=None, help="当前轮次（段跟踪用）")
+    s.add_argument("--entry-id", dest="entry_id", default=None, help="当前 user 条目 id（段指针）")
+    s.add_argument("--turn-tokens", dest="turn_tokens", type=int, default=0,
+                   help="本轮消耗的 token 估算（段硬上限用）")
     s.set_defaults(func=cmd_retrieve)
 
     s = sub.add_parser("snapshot", parents=[common])

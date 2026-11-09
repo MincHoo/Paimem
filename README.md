@@ -264,6 +264,51 @@ python mem.py harvest --drain    # 手动补跑
 
 ---
 
+
+## 会话段索引（C1）
+
+长会话压缩后，细节会永久丢失。段索引给被压缩的内容留一个指针。
+
+### 什么是一个段
+
+```
+段（segment）
+  ├ title   一行标题
+  ├ digest  首尾两条用户消息拼成
+  ├ 指针    {transcript, first_id, last_id, 轮次区间}
+  └ 向量    用 title + digest 嵌入，进同一套检索
+```
+
+### 怎么切段
+
+**按硬上限**：15 轮 或 12K token，到点就闭合。
+
+不按话题漂移——实测过了，短中文用户消息的余弦信号被噪声淹没：
+12 轮真实对话里，真实话题边界的余弦是 0.862，
+而同话题内部最低到 0.827。2-gram 重叠也几乎全为 0。
+
+### 会话链
+
+同一 scope 里，新段自动和上一段建 `continues` 边。隔天回来能顺着链往前翻。
+
+### 取回
+
+```bash
+python mem.py segment list
+python mem.py segment activate --query "继续上次那个记忆插件的设计"
+python mem.py segment get seg-20261010-abc123
+```
+
+`activate` 用 **语义 0.65 + 关键词 0.35** 打分。纯余弦在 50 段规模下
+信号/噪声只差 0.01–0.03，中文专名（"英文维基" vs "中文维基"）完全分不开。
+
+### 为什么放 tail 不放 system
+
+段索引在会话内会变几次（每次段闭合）。实测改 system section 会让缓存
+从该 section 的位置起全部失效，代价是全量重算。放 tail 每次只付该段的 token。
+
+---
+
 ## 会话锚点
 
 每个会话开始写一条锚点，落两处：

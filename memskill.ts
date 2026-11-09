@@ -139,6 +139,8 @@ let enabled = !DISABLED;
 let scope = process.env.MEM_SCOPE ?? "default";
 let injectedIds: string[] = [];
 let pendingCompact = false;
+/** 上一轮累计 token，用来算本轮增量（段硬上限用） */
+let lastSegTokens = 0;
 let skillHidden = false;
 /** 上次会话遗留的未总结信息（开窗时读，第一轮消费后删除） */
 let pendingInfo: { turns: number; tokens: number; ts: number } | null = null;
@@ -461,6 +463,7 @@ export default function (pi: ExtensionAPI) {
 		stats.viaSpawn = 0;
 		injectedIds = [];
 		pendingCompact = false;
+		lastSegTokens = 0;
 		pendingInfo = null;
 		try {
 			if (existsSync(PENDING_PATH)) {
@@ -572,6 +575,20 @@ export default function (pi: ExtensionAPI) {
 
 		const sid = ctx.sessionManager.getSessionId();
 		currentSid = sid;
+		// 段跟踪：把轮次、当前 user 条目 id、本轮 token 估算一起传给 mem.py，
+		// 它在同一次调用里判断该不该切段，避免额外往返
+		const entriesForSeg = ctx.sessionManager.getEntries();
+		const { turns: segTurns, chars: segChars } = scanSession(entriesForSeg);
+		const lastUserId = (() => {
+			for (let i = entriesForSeg.length - 1; i >= 0; i--) {
+				const e = entriesForSeg[i];
+				if (e?.message?.role === "user" && e.id) return e.id as string;
+			}
+			return "";
+		})();
+		const turnTokens = Math.max(1, Math.round(segChars / CHARS_PER_TOKEN) - lastSegTokens);
+		lastSegTokens = Math.round(segChars / CHARS_PER_TOKEN);
+
 		const args = (sc: string) => [
 			"retrieve",
 			"--session",
@@ -580,12 +597,21 @@ export default function (pi: ExtensionAPI) {
 			query,
 			"--scope",
 			sc,
+			"--turn",
+			String(segTurns + 1),
+			"--entry-id",
+			lastUserId,
+			"--turn-tokens",
+			String(turnTokens),
 			...(injectedIds.length ? ["--exclude-ids", injectedIds.join(",")] : []),
 		];
 		let out = (await runMem(args(scope), "/retrieve", {
 			session: sid,
 			query,
 			scope,
+			turn: segTurns + 1,
+			entry_id: lastUserId,
+			turn_tokens: turnTokens,
 			exclude_ids: injectedIds,
 		})) as RetrieveOut | null;
 		if (!out) return;
@@ -597,6 +623,9 @@ export default function (pi: ExtensionAPI) {
 				session: sid,
 				query,
 				scope: FALLBACK_SCOPE,
+				turn: segTurns + 1,
+				entry_id: lastUserId,
+				turn_tokens: turnTokens,
 				exclude_ids: injectedIds,
 			})) as RetrieveOut | null;
 			if (fb && (fb.debug?.candidates ?? 0) > 0) {
@@ -642,6 +671,26 @@ export default function (pi: ExtensionAPI) {
 		const lh = lastHarvest(entries);
 		let harvestReason = "";
 		if (harvestEnabled && pendingCompact) harvestReason = "压缩前";
+		// 段闭合 → 把新段的指针追加到 tail（放 tail 不放 system：
+		// 段索引会话内会变几次，放 system 每次都是全量重算）
+		const seg = (out as any).segment as
+			| { action?: string; closed?: { id: string; title: string; digest?: string; turns: number[] } }
+			| null;
+		if (seg?.action === "close" && seg.closed) {
+			const c = seg.closed;
+			const line =
+				`[mem:seg] 已归档 ${c.id}｜${c.title}｜第 ${c.turns?.[0]}–${c.turns?.[1]} 轮｜` +
+				`原文：python "${MEM_PY}" segment get ${c.id}`;
+			tailText = tailText ? tailText + "\n\n" + line : line;
+			try {
+				ctx.sessionManager.appendCustomEntry("mem_segment", {
+					id: c.id, title: c.title, turns: c.turns, ts: Date.now(),
+				});
+			} catch {
+				/* ignore */
+			}
+		}
+
 		if (harvestReason) {
 			const line = harvestLine(turns, Math.round(tokens / 1000), harvestReason);
 			tailText = tailText ? tailText + "\n\n" + line : line;
