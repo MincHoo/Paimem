@@ -1,6 +1,6 @@
 {
   "name": "pimem",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "description": "ΠMem — 本地长期记忆库 for pi：每轮注入 + 自动总结 + 主动检索。SQLite + ONNX，无 GPU 依赖。",
   "keywords": [
     "pi-package",
