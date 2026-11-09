@@ -78,7 +78,7 @@ LLM 每次会话都从零开始。上周踩过的坑、定下的方案、测出�
 
 ```bash
 # 1. 装包
-pi install "https://github.com/<you>/PiMem"
+pi install "https://github.com/MincHoo/Paimem"
 
 # 2. 准备 Python 环境（装依赖 + 下模型，约 3–5 分钟）
 python "<包目录>/setup.py"
