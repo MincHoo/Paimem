@@ -20,3 +20,7 @@ pi-adapter.log
 .idea/
 .DS_Store
 Thumbs.db
+_qa_*.json
+_qa_*.txt
+_seed_*.jsonl
+*.mem.jsonl
