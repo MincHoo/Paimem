@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -71,6 +72,16 @@ DEFAULTS = {
     "inject.stable_k": "8",
     "inject.dynamic_k": "3",
     "inject.tail_item_chars": "180",
+    # 会话结束后异步总结（留空 = 不做，回退到下次会话提醒）
+    "harvest.endpoint": "",
+    "harvest.model": "",
+    "harvest.api_key": "",
+    "harvest.max_chars": "60000",
+    "harvest.timeout": "180",
+    "harvest.keep_days": "7",
+    "harvest.max_per_session": "5",
+    "harvest.sim_skip": "0.90",
+    "harvest.stale_min": "5",
 }
 
 CLAIM_HALFLIFE = {"fact": 35, "preference": 180, "decision": 90,
@@ -201,6 +212,19 @@ CREATE TABLE IF NOT EXISTS mem_sessions(
   last_query TEXT, created_at INTEGER, updated_at INTEGER
 );
 
+-- 会话锚点：每个会话开始写一条，短期工作记忆将来挂在这个锚点上
+CREATE TABLE IF NOT EXISTS mem_anchors(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  scope TEXT,
+  cwd TEXT,
+  kind TEXT DEFAULT 'session_start',   -- session_start / compaction / resume
+  prev_session TEXT,                   -- 上一个会话，用于跨会话衔接
+  payload TEXT,                        -- 预留：将来放工作集快照
+  created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_anchor_sid ON mem_anchors(session_id, created_at);
+
 CREATE TABLE IF NOT EXISTS mem_graph_meta(
   scope TEXT PRIMARY KEY, built_at INTEGER, item_count INTEGER, edge_count INTEGER
 );
@@ -210,6 +234,21 @@ CREATE TABLE IF NOT EXISTS identity(
 );
 
 CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
+
+-- 会话结束后的异步总结任务队列（跨进程、可断点续跑）
+CREATE TABLE IF NOT EXISTS harvest_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT,
+  scope TEXT,
+  transcript TEXT,
+  status TEXT DEFAULT 'pending',   -- pending / running / done / failed
+  attempts INTEGER DEFAULT 0,
+  heartbeat REAL,
+  result TEXT,
+  created_at REAL,
+  updated_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_hj_status ON harvest_jobs(status, id);
 
 CREATE TRIGGER IF NOT EXISTS no_hard_delete
 BEFORE DELETE ON mem_items
@@ -316,6 +355,9 @@ def apply_tunables(cfg):
     num("inject.stable_k", "STABLE_K", int)
     num("inject.dynamic_k", "DYNAMIC_K", int)
     num("inject.tail_item_chars", "TAIL_ITEM_CHARS", int)
+    num("harvest.max_per_session", "HARVEST_MAX_PER_SESSION", int)
+    num("harvest.sim_skip", "HARVEST_SIM_SKIP")
+    num("harvest.stale_min", "HARVEST_STALE_MIN", int)
 
 
 def init_db(con):
@@ -1354,6 +1396,236 @@ def cmd_graph(a):
 
 # ---------------- 常驻服务 ----------------
 
+
+
+# ---------------- 会话锚点（短期工作记忆的挂载点） ----------------
+def cmd_anchor(a):
+    con = db(); init_db(con)
+    now = int(time.time())
+
+    if a.show:
+        rows = con.execute(
+            "SELECT id,session_id,scope,cwd,kind,prev_session,created_at FROM mem_anchors"
+            " WHERE session_id=? ORDER BY id DESC LIMIT 20", (a.session or "",)).fetchall()
+        print(json.dumps({"anchors": [dict(r) for r in rows]}, ensure_ascii=False, indent=2))
+        return
+
+    # 上一个会话：同 scope 里最近的一条锚点
+    prev = con.execute(
+        "SELECT session_id FROM mem_anchors WHERE scope=? AND session_id<>?"
+        " ORDER BY id DESC LIMIT 1", (a.scope or "global", a.session or "")).fetchone()
+    prev_sid = prev["session_id"] if prev else None
+
+    con.execute(
+        "INSERT INTO mem_anchors(session_id,scope,cwd,kind,prev_session,payload,created_at)"
+        " VALUES(?,?,?,?,?,?,?)",
+        (a.session or "", a.scope or "global", a.cwd or "", a.kind or "session_start",
+         prev_sid, None, now))
+    con.commit()
+    aid = con.execute("SELECT last_insert_rowid() i").fetchone()["i"]
+
+    # 顺带报告：上个会话留下了多少没确认的自动候选
+    pending_drafts = con.execute(
+        "SELECT COUNT(*) c FROM mem_items WHERE scope=? AND status='draft'"
+        " AND tags LIKE '%auto-harvest%'", (a.scope or "global",)).fetchone()["c"]
+    print(json.dumps({"ok": True, "anchor": aid, "session": a.session,
+                      "prev_session": prev_sid, "pending_drafts": pending_drafts},
+                     ensure_ascii=False))
+    return
+
+
+# ---------------- 会话结束后的异步总结（纯 CPU，不调模型） ----------------
+HARVEST_MAX_PER_SESSION = 5
+HARVEST_SIM_SKIP = 0.90          # 与现有记忆相似度超过此值视为已覆盖
+HARVEST_STALE_MIN = 5            # 心跳超过这么久没更新的 running 视为僵死
+
+# 从会话里挑候选句子的规则。宁可漏，不要错——落库是 draft，不进检索。
+_RE_MEASURE = re.compile(r"\d+(\.\d+)?\s*(ms|毫秒|秒|分钟|小时|天|MB|GB|KB|%|倍|条|轮|token|chunk/s|it/s)")
+_RE_IMPERATIVE = re.compile(r"(必须|不要|别用|记得|注意|改成|应该用|以后都|不能|务必|禁止|改用|换成)")
+_RE_ERROR = re.compile(r"(报错|错误|失败|Error|error|Traceback|异常|不支持|无法)")
+_RE_FIX = re.compile(r"(修好|解决|改用|换成|改成|绕过|回退|降级|重装|加个|设成)")
+_RE_CMD = re.compile(r"^\s*(python|pip|git|npm|pnpm|curl|pi|cd|set|export|docker|llama)\b")
+_RE_NOISE = re.compile(r"^\s*(好的|可以|明白|收到|ok|OK|嗯|行|是的|没问题)\s*[。.!！]?\s*$")
+
+
+def _classify(line):
+    """给一句话判 claim_type 和权重（用于排序取前 5 条）"""
+    score, ctype = 0.0, "observation"
+    if _RE_MEASURE.search(line):
+        score += 2.0; ctype = "fact"
+    if _RE_IMPERATIVE.search(line):
+        score += 2.0; ctype = "preference" if "不要" in line or "别" in line else "procedure"
+    if _RE_ERROR.search(line):
+        score += 1.0
+    if _RE_FIX.search(line):
+        score += 1.5; ctype = "procedure"
+    if _RE_CMD.match(line):
+        score += 1.0; ctype = "procedure"
+    if 20 <= len(line) <= 160:
+        score += 0.5
+    if re.search(r"[\u4e00-\u9fa5]", line):
+        score += 0.3
+    return score, ctype
+
+
+def _split_candidates(messages):
+    """把转录切成候选句：按句号/换行切，过滤噪音"""
+    out = []
+    for m in messages:
+        role = m.get("role")
+        text = (m.get("text") or "").strip()
+        if not text or role not in ("user", "assistant"):
+            continue
+        # 用户的话权重更高（用户说的偏好/约束最可信）
+        bias = 1.2 if role == "user" else 1.0
+        for raw in re.split(r"[\n。！？]", text):
+            line = raw.strip().strip("-*#> ").strip()
+            if len(line) < 12 or len(line) > 200:
+                continue
+            if _RE_NOISE.match(line):
+                continue
+            if line.count("```") or line.startswith(("|", "//", "/*")):
+                continue
+            score, ctype = _classify(line)
+            if score < 2.0:
+                continue
+            out.append({"content": line, "claim_type": ctype,
+                        "score": score * bias, "role": role})
+    # 同一句话只留最高分
+    seen, uniq = set(), []
+    for c in sorted(out, key=lambda x: -x["score"]):
+        k = c["content"][:40]
+        if k in seen:
+            continue
+        seen.add(k); uniq.append(c)
+    return uniq
+
+
+def _enqueue(con, sid, scope, transcript):
+    now = time.time()
+    cur = con.execute(
+        "INSERT INTO harvest_jobs(session_id,scope,transcript,status,attempts,created_at,updated_at)"
+        " VALUES(?,?,?,'pending',0,?,?)", (sid, scope, transcript, now, now))
+    con.commit()
+    return cur.lastrowid
+
+
+def _claim_job(con):
+    """取一条待办：pending，或心跳超时的 running（上次进程崩了）"""
+    stale = time.time() - HARVEST_STALE_MIN * 60
+    row = con.execute(
+        "SELECT id,session_id,scope,transcript,attempts FROM harvest_jobs"
+        " WHERE status='pending' OR (status='running' AND (heartbeat IS NULL OR heartbeat<?))"
+        " ORDER BY id LIMIT 1", (stale,)).fetchone()
+    if not row:
+        return None
+    con.execute("UPDATE harvest_jobs SET status='running',attempts=attempts+1,"
+                "heartbeat=?,updated_at=? WHERE id=?",
+                (time.time(), time.time(), row["id"]))
+    con.commit()
+    return row
+
+
+def _run_job(con, job):
+    """处理一条任务：机械提取 → 交给 add 走完整写入路径（去重/冲突/指令检测都复用）"""
+    jid, sid, scope, path = job["id"], job["session_id"], job["scope"], job["transcript"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tr = json.load(f)
+    except Exception as e:
+        return {"job": jid, "status": "failed", "error": "bad_transcript: %s" % str(e)[:100]}
+
+    cands = _split_candidates(tr.get("messages") or [])
+    if not cands:
+        return {"job": jid, "status": "done", "written": 0, "reason": "no_candidate"}
+
+    # 先算向量做粗筛：与同 scope 现有 active 记忆 sim>=0.90 的视为已覆盖，不进 add
+    texts = [c["content"] for c in cands]
+    try:
+        vecs = embed(["passage: " + t for t in texts])
+    except Exception as e:
+        return {"job": jid, "status": "failed", "error": "embed_failed: %s" % str(e)[:100]}
+
+    # 注意：必须包含 draft，否则每次会话都会把同样的候选重新写一遍
+    rows, existing = load_vectors(con, scope=scope, include_drafts=True)
+    written, skipped, kept = [], 0, []
+    for c, v in zip(cands, vecs):
+        if len(written) >= HARVEST_MAX_PER_SESSION:
+            break
+        if len(existing):
+            best = float((existing @ v).max())
+            if best >= HARVEST_SIM_SKIP:
+                skipped += 1
+                continue
+        kept.append((c, v))
+
+    for c, _v in kept[:HARVEST_MAX_PER_SESSION]:
+        ns = argparse.Namespace(
+            content=c["content"], scope=scope, claim_type=c["claim_type"],
+            origin="self", model="harvest", endpoint="",
+            evidence=None, reproduce=None, force=True, quiet=True, actor="harvest",
+            session=sid or None, turn=None, allow_instruction=False, no_dedup=False,
+            assertion=None, tags="auto-harvest", entities="", importance=0.4,
+        )
+        try:
+            cmd_add(ns)          # 走完整写入路径；落 draft 由 decide_status_and_verified 决定
+            written.append(c["content"][:60])
+        except Exception as e:
+            skipped += 1
+
+    return {"job": jid, "status": "done", "candidates": len(cands),
+            "written": len(written), "skipped": skipped, "items": written}
+
+
+def _drain(con, max_jobs=20):
+    """把队列跑空。进程随时可能被杀，靠心跳 + pending 状态续跑。"""
+    results = []
+    for _ in range(max_jobs):
+        job = _claim_job(con)
+        if not job:
+            break
+        try:
+            r = _run_job(con, job)
+        except Exception as e:
+            r = {"job": job["id"], "status": "failed", "error": str(e)[:200]}
+        con.execute("UPDATE harvest_jobs SET status=?,result=?,updated_at=? WHERE id=?",
+                    (r.get("status", "failed"), json.dumps(r, ensure_ascii=False),
+                     time.time(), job["id"]))
+        con.commit()
+        results.append(r)
+    return results
+
+
+def cmd_harvest(a):
+    con = db(); init_db(con)
+    sub = getattr(a, "harvest_cmd", None) or ("drain" if a.drain else None)
+
+    if a.list:
+        rows = con.execute(
+            "SELECT id,session_id,scope,status,attempts,updated_at,result FROM harvest_jobs"
+            " ORDER BY id DESC LIMIT 20").fetchall()
+        print(json.dumps({"jobs": [dict(r) for r in rows],
+                          "pending": con.execute("SELECT COUNT(*) c FROM harvest_jobs"
+                                                 " WHERE status IN ('pending','running')").fetchone()["c"]},
+                         ensure_ascii=False, indent=2))
+        return
+
+    if a.transcript:
+        if not os.path.exists(a.transcript):
+            print(json.dumps({"error": "no_transcript", "path": a.transcript}, ensure_ascii=False)); return
+        jid = _enqueue(con, a.session or "", a.scope or "global", a.transcript)
+        if a.enqueue_only:
+            print(json.dumps({"ok": True, "enqueued": jid}, ensure_ascii=False)); return
+
+    if a.drain or a.transcript:
+        res = _drain(con)
+        print(json.dumps({"ok": True, "processed": len(res), "results": res},
+                         ensure_ascii=False, indent=2))
+        return
+
+    print(json.dumps({"error": "need --transcript or --drain or --list"}, ensure_ascii=False))
+
+
 # ---------------- 端点白名单管理 ----------------
 def _read_trust_file():
     try:
@@ -1919,6 +2191,26 @@ def main():
     s.add_argument("--candidates", type=int, default=30)
     s.add_argument("--pretty", action="store_true")
     s.set_defaults(func=cmd_snapshot)
+
+    s = sub.add_parser("anchor", parents=[common])
+    s.add_argument("--session", default=None)
+    s.add_argument("--scope", default=None)
+    s.add_argument("--cwd", default=None)
+    s.add_argument("--kind", default="session_start",
+                   choices=["session_start", "compaction", "resume"])
+    s.add_argument("--show", action="store_true", help="查看该会话的锚点")
+    s.set_defaults(func=cmd_anchor)
+
+    s = sub.add_parser("harvest", parents=[common])
+    s.add_argument("--transcript", default=None, help="会话转录 JSON：入队")
+    s.add_argument("--scope", default=None)
+    s.add_argument("--session", default=None)
+    s.add_argument("--drain", action="store_true", help="把队列跑空（含上次没跑完的）")
+    s.add_argument("--enqueue-only", dest="enqueue_only", action="store_true",
+                   help="只入队，不处理（给适配器用）")
+    s.add_argument("--list", action="store_true", help="看队列")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true")
+    s.set_defaults(func=cmd_harvest)
 
     t = sub.add_parser("trust", parents=[common])
     tsub = t.add_subparsers(dest="trust_cmd")

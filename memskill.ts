@@ -27,7 +27,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { appendFile, mkdir } from "node:fs/promises";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -81,10 +81,10 @@ const LOG_PATH = join(MEM_HOME, "pi-adapter.log");
 const PENDING_PATH = join(MEM_HOME, "pending.json");
 
 // ---- 触发阈值（实测：本会话 123 轮 / 453K token / 平均 3.7K 每轮）----
-const TOKENS_FIRST = Number(process.env.MEM_TOKENS_FIRST ?? 60_000);
-const TOKENS_STEP = Number(process.env.MEM_TOKENS_STEP ?? 40_000);
-const TURNS_STEP = Number(process.env.MEM_TURNS_STEP ?? 10);
-const TURNS_MIN_TOKENS = Number(process.env.MEM_TURNS_MIN_TOKENS ?? 2_000);
+/** 会话转录落盘目录，供 detached 的 harvest 进程读取 */
+const TRANSCRIPT_DIR = join(MEM_HOME, "transcripts");
+/** 会话结束时，至少这么多字符才值得入队（太短的会话没什么可总结的） */
+const HARVEST_MIN_CHARS = Number(process.env.MEM_HARVEST_MIN_CHARS ?? 2_000);
 const CHARS_PER_TOKEN = 3.3;
 
 type RetrieveOut = {
@@ -109,6 +109,7 @@ type Stats = {
 	tailBytes: number;
 	injected: number;
 	harvests: number;
+	anchorId: number | null;
 	lastHash: string | null;
 	lastTail: string;
 	lastDebug: RetrieveOut["debug"] | null;
@@ -125,6 +126,7 @@ const stats: Stats = {
 	tailBytes: 0,
 	injected: 0,
 	harvests: 0,
+	anchorId: null,
 	lastHash: null,
 	lastTail: "",
 	lastDebug: null,
@@ -225,6 +227,24 @@ async function callDaemon(path: string, body: unknown): Promise<any | null> {
 		if (!r.ok) return null;
 		return await r.json();
 	} catch {
+		return null;
+	}
+}
+
+/** 直接跑 mem.py 子命令并解析 JSON（不走常驻服务） */
+async function runPy(args: string[]): Promise<any | null> {
+	try {
+		const py = await resolvePython();
+		if (!py) return null;
+		const { stdout } = await execFileAsync(py, [MEM_PY, ...args], {
+			timeout: TIMEOUT,
+			maxBuffer: 4 * 1024 * 1024,
+			windowsHide: true,
+			env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+		});
+		return JSON.parse(stdout);
+	} catch (e) {
+		await log({ t: Date.now(), event: "py_error", args: args.slice(0, 2), err: String(e).slice(0, 400) });
 		return null;
 	}
 }
@@ -354,6 +374,66 @@ function harvestLine(turn: number, tokensK: number, reason: string): string {
 	);
 }
 
+/** 把会话导出成 harvest 进程能读的 JSON。只留文字，不要 thinking 和工具参数。 */
+function dumpTranscript(entries: any[], sid: string, scope: string, cwd: string): {
+	path: string; chars: number; turns: number;
+} {
+	const messages: Array<{ role: string; text: string }> = [];
+	let chars = 0;
+	let turns = 0;
+	for (const e of entries) {
+		if (e.type === "custom_message" || e.type === "custom") continue;
+		const m = e.message;
+		if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
+		if (m.role === "user") turns++;
+		let text = "";
+		const c = m.content;
+		if (typeof c === "string") text = c;
+		else if (Array.isArray(c)) {
+			for (const b of c) {
+				if (!b || typeof b !== "object") continue;
+				if (typeof b.text === "string") text += b.text + "\n";
+			}
+		}
+		text = text.trim();
+		if (!text) continue;
+		chars += text.length;
+		messages.push({ role: m.role, text });
+	}
+	const path = join(TRANSCRIPT_DIR, `${sid || "anon"}-${Date.now()}.json`);
+	try {
+		mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+		writeFileSync(
+			path,
+			JSON.stringify({ session: sid, scope, cwd, turns, ts: Date.now(), messages }),
+			"utf8",
+		);
+	} catch {
+		return { path: "", chars: 0, turns: 0 };
+	}
+	return { path, chars, turns };
+}
+
+/**
+ * 拉起一个脱离父进程的 harvest 进程。
+ * detached + stdio:ignore + unref 三件套：pi 退出后它继续跑完，
+ * 中途被杀则由队列里的 running + 心跳超时在下次 --drain 时续跑。
+ */
+function spawnHarvest(args: string[]): boolean {
+	try {
+		const child = spawn(pyBin, [MEM_PY, "harvest", ...args], {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+			env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+		});
+		child.unref();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
 		// 首次运行：库还没建，提示怎么装
@@ -372,6 +452,7 @@ export default function (pi: ExtensionAPI) {
 		stats.tailBytes = 0;
 		stats.injected = 0;
 		stats.harvests = 0;
+		stats.anchorId = null;
 		stats.lastHash = null;
 		stats.lastTail = "";
 		stats.lastDebug = null;
@@ -396,28 +477,76 @@ export default function (pi: ExtensionAPI) {
 		if (typeof cfg.harvest === "boolean") harvestEnabled = cfg.harvest;
 		if (typeof cfg.scope === "string" && cfg.scope) scope = cfg.scope;
 		else scope = resolveScope(cwd);
+		// 会话锚点：短期工作记忆将来挂在这里。
+		// 落两处：DB（mem_anchors，CLI 可查）+ pi 条目（跟着转录走，压缩后仍在）
+		try {
+			const cwd0 = ctx.sessionManager.getCwd?.() ?? process.cwd();
+			const anchor = await runPy([
+				"anchor", "--session", currentSid || "anon",
+				"--scope", scope, "--cwd", cwd0, "--kind", "session_start",
+			]);
+			if (anchor) {
+				ctx.sessionManager.appendCustomEntry("mem_anchor", {
+					kind: "session_start",
+					session: currentSid,
+					scope,
+					cwd: cwd0,
+					ts: Date.now(),
+					prevSession: anchor.prev_session ?? null,
+					pendingDrafts: anchor.pending_drafts ?? 0,
+					anchorId: anchor.anchor ?? null,
+				});
+				stats.anchorId = anchor.anchor ?? null;
+				if (anchor.pending_drafts > 0) {
+					pendingInfo = {
+						...((pendingInfo as any) ?? {}),
+						autoDrafts: anchor.pending_drafts,
+					} as any;
+				}
+			}
+		} catch (e) {
+			await log({ t: Date.now(), event: "anchor_error", err: String(e) });
+		}
+
+		// 上次可能有没跑完的总结任务（关机、崩溃、杀进程）→ 补跑
+		// detached 拉起，不阻塞会话启动；队列里 pending / 心跳超时的 running 都会被捡起来
+		if (harvestEnabled) {
+			const ok = spawnHarvest(["--drain"]);
+			await log({ t: Date.now(), event: "harvest_recover", ok });
+		}
 		// 后台拉起常驻服务，不阻塞会话启动
 		if (enabled && USE_DAEMON && !daemonReady) daemonReady = ensureDaemon();
 	});
 
 	// 插件退出 / 重载 / 切会话 → 关掉服务
 	pi.on("session_shutdown", async (event, ctx) => {
-		// 关窗时若还有没总结的量 → 留标记给下次会话（不阻塞、不调模型）
-		if (event.reason === "quit" && harvestEnabled) {
+		// 会话结束 = 总结的锚点。入队（快，毫秒级），然后交给 detached 进程跑。
+		if (harvestEnabled && (event.reason === "quit" || event.reason === "reload")) {
 			try {
 				const entries = ctx.sessionManager.getEntries();
-				const { turns, chars } = scanSession(entries);
-				const tokens = Math.round(chars / CHARS_PER_TOKEN);
+				const cwd = ctx.sessionManager.getCwd?.() ?? process.cwd();
+				const sid = currentSid || "anon";
+				const { path, chars, turns } = dumpTranscript(entries, sid, scope, cwd);
 				const lh = lastHarvest(entries);
-				if (turns > 0 && tokens - lh.tokens >= TURNS_MIN_TOKENS && turns - lh.turn >= 3) {
-					writeFileSync(
-						PENDING_PATH,
-						JSON.stringify({ turns, tokens, ts: Date.now() }),
-						"utf8",
-					);
+				const sinceLast = chars - (lh.tokens ?? 0) * CHARS_PER_TOKEN;
+				if (path && chars >= HARVEST_MIN_CHARS) {
+					const ok = spawnHarvest([
+						"--transcript", path, "--scope", scope, "--session", sid,
+					]);
+					await log({
+						t: Date.now(), event: "harvest_spawn", sid, turns,
+						chars, sinceLast: Math.round(sinceLast), ok,
+					});
+					if (!ok) {
+						writeFileSync(
+							PENDING_PATH,
+							JSON.stringify({ turns, tokens: Math.round(chars / CHARS_PER_TOKEN), ts: Date.now() }),
+							"utf8",
+						);
+					}
 				}
-			} catch {
-				/* ignore */
+			} catch (e) {
+				await log({ t: Date.now(), event: "harvest_dump_error", err: String(e) });
 			}
 		}
 		if (event.reason === "reload" || event.reason === "quit") stopDaemon();
@@ -504,20 +633,15 @@ export default function (pi: ExtensionAPI) {
 			stats.stableBytes = Buffer.byteLength(stableText, "utf8");
 		}
 
-		// 钩子 2/3：token / 轮次
+		// 唯一保留的线程内钩子：压缩前。压缩是不可逆的信息丢失，值得打断一次。
+		// 常规总结已改为会话结束后由 detached 进程处理，不占工作线程。
 		const entries = ctx.sessionManager.getEntries();
 		const { turns: prevTurns, chars } = scanSession(entries);
 		const turns = prevTurns + 1;
 		const tokens = Math.round(chars / CHARS_PER_TOKEN);
 		const lh = lastHarvest(entries);
 		let harvestReason = "";
-		if (harvestEnabled) {
-			if (pendingCompact) harvestReason = "压缩前";
-			else if (tokens - lh.tokens >= (lh.tokens === 0 ? TOKENS_FIRST : TOKENS_STEP))
-				harvestReason = "上下文增长";
-			else if (turns - lh.turn >= TURNS_STEP && tokens - lh.tokens >= TURNS_MIN_TOKENS)
-				harvestReason = "多轮对话";
-		}
+		if (harvestEnabled && pendingCompact) harvestReason = "压缩前";
 		if (harvestReason) {
 			const line = harvestLine(turns, Math.round(tokens / 1000), harvestReason);
 			tailText = tailText ? tailText + "\n\n" + line : line;
@@ -716,6 +840,7 @@ export default function (pi: ExtensionAPI) {
 					`轮次: ${stats.turns}  (stable new ${stats.cacheNew} / hit ${stats.cacheHit})`,
 					`stable: ${stats.stableBytes}B  hash ${stats.lastHash ?? "-"}`,
 					`tail: 累计 ${stats.tailBytes}B / 注入 ${stats.injected} 次 / harvest ${stats.harvests} 次`,
+					`锚点: ${stats.anchorId ? "#" + stats.anchorId : "未写入"} / 会话 ${currentSid ?? "-"}`,
 					d
 						? `最近: ${d.candidates} 候选 best=${Number(d.best).toFixed(3)} drift=${d.drift} ${d.elapsedMs}ms`
 						: "最近: -",

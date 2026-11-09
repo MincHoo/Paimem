@@ -63,6 +63,12 @@ stable_k = 8          # 进 system 的长期记忆条数（缓存友好，贵在
 dynamic_k = 3         # 进尾部的当前相关条数（每轮付费）
 tail_item_chars = 180 # 尾部单条截断长度
 
+[harvest]
+# 会话结束后异步总结。提取是纯 CPU 规则，不调模型。
+max_per_session = 5   # 每个会话最多落几条
+sim_skip = 0.90       # 与现有记忆相似度超过此值视为已覆盖
+stale_min = 5         # 心跳超过这么多分钟没更新，视为僵死任务，下次 --drain 重跑
+
 [quota]
 max_writes_per_minute = 5
 max_searches_per_minute = 20
