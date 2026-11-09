@@ -669,15 +669,16 @@ def rank(cands, now=None, q_grams=None, graph=None):
 
     scored = {}
     for r, sim in cands:
+        sim_raw = float(sim)
         if norm:
-            sim = (1 - SIM_NORM_ALPHA) * float(sim) + SIM_NORM_ALPHA * norm.get(id(r), float(sim))
+            sim = (1 - SIM_NORM_ALPHA) * sim_raw + SIM_NORM_ALPHA * norm.get(id(r), sim_raw)
         tag_cov = coverage(q_grams, r["tags"] or "")
         kw_cov = coverage(q_grams, r["content"] or "")
         has_tags = bool((r["tags"] or "").strip())
         base = (W_CONTENT * float(sim)
                 + (W_TAGS * tag_cov if has_tags else 0.0)
                 + W_KEYWORD * kw_cov) / w_sum_base
-        scored[r["id"]] = {"row": r, "sim": float(sim), "base": base,
+        scored[r["id"]] = {"row": r, "sim": float(sim), "sim_raw": sim_raw, "base": base,
                            "graph": 0.0, "has_graph": False}
 
     # 第二遍：图分（取邻居基础分的最大值 × 边权）
@@ -704,7 +705,7 @@ def rank(cands, now=None, q_grams=None, graph=None):
     for st in scored.values():
         r = st["row"]
         total = st["base"] * decay_factor(r, now) * trust_factor(r)
-        out.append((total, st["sim"], r))
+        out.append((total, st.get("sim_raw", st["sim"]), r))
     out.sort(key=lambda x: -x[0])
     return out
 
