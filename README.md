@@ -243,6 +243,7 @@ pi 启动 → 拉起 mem.py serve（预热 ~900ms）
 
 ```bash
 python mem.py selftest        # 11 项不变量
+python eval_mem.py            # 记忆质量：Hit@k / MRR + 三个专项
 python mem.py serve --port 7788   # 手动起服务
 python mem.py stats
 ```

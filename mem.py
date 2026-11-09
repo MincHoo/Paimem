@@ -574,6 +574,11 @@ W_TAGS = 0.20
 W_KEYWORD = 0.15
 W_GRAPH = 0.15
 W_DENOM = W_CONTENT + W_TAGS + W_KEYWORD + W_GRAPH
+# e5 中文相似度被压在 0.84~0.89 的窄带里，content 项方差趋近 0，
+# 排序会被 tags/keyword 的方差主导（实测：语义第 1 名被关键词挤出 top-8）。
+# 候选内 min-max 归一化把方差拉回来；span 太小时不归一，避免放大噪声。
+SIM_NORM_ALPHA = 0.5
+SIM_NORM_MIN_SPAN = 0.02
 
 
 def ngrams(text, n=2):
@@ -650,8 +655,22 @@ def rank(cands, now=None, q_grams=None, graph=None):
     w_sum_base = W_CONTENT + W_TAGS + W_KEYWORD
     w_sum_all = w_sum_base + W_GRAPH
 
+    # 候选内归一化：把窄带相似度拉回可用方差
+    sim_list = [float(s) for _, s in cands]
+    if sim_list:
+        lo, hi = min(sim_list), max(sim_list)
+        span = hi - lo
+        if span >= SIM_NORM_MIN_SPAN:
+            norm = {id(r): (float(s) - lo) / span for r, s in cands}
+        else:
+            norm = {}
+    else:
+        norm = {}
+
     scored = {}
     for r, sim in cands:
+        if norm:
+            sim = (1 - SIM_NORM_ALPHA) * float(sim) + SIM_NORM_ALPHA * norm.get(id(r), float(sim))
         tag_cov = coverage(q_grams, r["tags"] or "")
         kw_cov = coverage(q_grams, r["content"] or "")
         has_tags = bool((r["tags"] or "").strip())
