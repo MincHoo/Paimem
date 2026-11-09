@@ -495,21 +495,31 @@ def build_bm25(docs, k1=1.2, b=0.75):
     return score, idf
 
 
-def expand_graph(graph, seed_ids, depth=2, per_node=5, max_add=20):
-    """从种子做受限 BFS，返回 {id: 路径强度}"""
+GRAPH_HOP_GAMMA = 0.85   # 每跳衰减：2 跳的路径强度 = w1 * w2 * 0.85^2
+
+
+def expand_graph(graph, seed_ids, depth=2, per_node=5, max_add=20, gamma=None):
+    """从种子做受限 BFS，返回 {id: 路径强度}
+
+    路径强度 = 沿路各边权之积 × gamma^跳数。
+    衰减只用于**打分**，不用于剪枝（剪枝看 per_node / max_add）。
+    """
+    gamma = GRAPH_HOP_GAMMA if gamma is None else gamma
     seen = set(seed_ids)
-    frontier = list(seed_ids)
+    frontier = [(sid, 1.0) for sid in seed_ids]
     out = {}
-    for _ in range(depth):
+    for hop in range(depth):
         nxt = []
-        for node in frontier:
+        for node, strength in frontier:
             edges = sorted(graph.get(node, []), key=lambda x: -x[1])[:per_node]
             for nb, w in edges:
                 if nb in seen:
                     continue
                 seen.add(nb)
-                out[nb] = max(out.get(nb, 0.0), w)
-                nxt.append(nb)
+                s = strength * float(w) * gamma
+                if s > out.get(nb, 0.0):
+                    out[nb] = s
+                nxt.append((nb, s))
                 if len(out) >= max_add:
                     return out
         frontier = nxt
@@ -537,9 +547,9 @@ def candidates(con, qv, scope, query="", include_cold=False, include_drafts=Fals
         return sem
 
     seeds = [r["id"] for r, _ in sem[:expand_seeds]]
-    extra_ids = expand_graph(graph, seeds, depth=expand, max_add=expand_max)
+    path = expand_graph(graph, seeds, depth=expand, max_add=expand_max)
     have = {r["id"] for r, _ in sem}
-    extra_ids = [i for i in extra_ids if i not in have]
+    extra_ids = [i for i in path if i not in have]
     if not extra_ids:
         return sem
 
@@ -553,7 +563,8 @@ def candidates(con, qv, scope, query="", include_cold=False, include_drafts=Fals
                           "importance, n_tok, created_at, last_hit, tags, status, cold "
                           "FROM mem_items WHERE id IN (%s)" % q, extra_ids).fetchall()
     for r in ex_rows:
-        sim = (bm.get(r["id"], 0.0) / mx) if mx > 0 else 0.0
+        bm_sim = (bm.get(r["id"], 0.0) / mx) if mx > 0 else 0.0
+        sim = max(bm_sim, path.get(r["id"], 0.0))   # 词面或图路径，取强者
         sem.append((r, sim))
     return sem
 
@@ -1031,6 +1042,7 @@ def cmd_consolidate(a):
 
 GRAPH_RELATED = 0.88   # 基础门槛；真正成边还需要「共享标签」或 sim>=0.95
 GRAPH_NEARDUP = 0.97
+GRAPH_CONTRA_K = 5      # 每节点最多留几条矛盾边
 GRAPH_TOP_K = 5
 GRAPH_REBUILD_NEW = 10
 GRAPH_REBUILD_RATIO = 1.2
@@ -1094,15 +1106,21 @@ def cmd_graph(a):
                 etype = "contradicts"
             cand.append((ids[i], ids[j], etype, sim))
 
-    # 每节点 top-K（contradicts 永不剪）
+    # 每节点 top-K。contradicts 也参与剪枝但配额更高（否则图会爆炸：
+    # 1954 节点实测未剪时 66k 条矛盾边，平均每节点 34 条）
     keep = set()
     by_node = {}
+    contra = {}
     for k, (u, v, et, w) in enumerate(cand):
         if et == "contradicts":
-            keep.add(k)
+            contra.setdefault(u, []).append((w, k))
+            contra.setdefault(v, []).append((w, k))
             continue
         by_node.setdefault(u, []).append((w, k))
         by_node.setdefault(v, []).append((w, k))
+    for node, lst in contra.items():
+        for w, k in sorted(lst, reverse=True)[:GRAPH_CONTRA_K]:
+            keep.add(k)
     for node, lst in by_node.items():
         for w, k in sorted(lst, reverse=True)[:GRAPH_TOP_K]:
             keep.add(k)
