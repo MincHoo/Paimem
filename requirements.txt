@@ -1,0 +1,5 @@
+# mem-skill 依赖
+# Python 3.9+ 必需；sqlite3 是标准库，无需安装
+numpy>=1.24
+onnxruntime>=1.16
+tokenizers>=0.15

@@ -1,0 +1,59 @@
+# mem-skill 配置模板
+# 复制到 ~/.mem/mem.toml 后修改（python mem.py init 会自动生成一份）
+
+[db]
+path = "~/.mem/mem.db"
+
+[model]
+path = "~/.mem/models/e5-small-onnx"
+backend = "onnx"          # 仅支持 onnx（无 torch 依赖）
+
+[decay]
+# 热度衰减半衰期（天）。调大=旧记忆留更久但噪音多；调小=更快沉底。
+# 建议：项目周期 2 周调 14；长期个人助手调 180。不建议低于 7。
+half_life_days = 35
+# 低于此热度进冷区，不参与默认检索（--include-cold 可查）
+cold_threshold = 0.15
+# 被检索到时的复活分数
+revive_score = 0.1
+
+[write]
+# 相似度超过此值视为重复，转为 reinforce 而不是新增。
+# ⚠️ 必须按模型实测校准：e5-small 中文无关内容余弦就有 0.85–0.92，
+#    同义改写可达 0.985。默认 0.96 只合并真正的近似重复。
+dedup_sim = 0.96
+# 单条记忆长度上限，超长应拆条
+max_content_chars = 2000
+# 开启后 verified=2 必须带 --reproduce
+strict_evidence = false
+
+[search]
+default_k = 5
+max_tokens = 1500
+
+[quota]
+max_writes_per_minute = 5
+max_searches_per_minute = 20
+max_daily_writes = 300
+
+# ============ 端点白名单 ============
+# 按「实际连接端点」登记，不按模型自报的名字。
+#   large   -> 可写 verified<=1，active
+#   medium  -> 可写 verified=0，active
+#   small   -> 只能写 draft
+#   unknown -> 只能写 draft（最保守）
+#
+# ⚠️ 配置即信任：防无意降级，不防恶意提权。
+# ⚠️ 换模型不可感知：同一端口换了模型系统探测不到，请显式改这里。
+# ⚠️ 自报不可信：origin_model 只做展示，不参与权限判定。
+# ⚠️ 远程默认不可信：未登记的 http/https 一律按 draft 处理。
+
+[[trust.endpoints]]
+endpoint = "http://127.0.0.1:11434"
+model_class = "unknown"
+note = "本机 ollama，后端可能是任意规格模型"
+
+[[trust.endpoints]]
+endpoint = "http://127.0.0.1:8080"
+model_class = "unknown"
+note = "本机 llama.cpp server"

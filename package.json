@@ -1,0 +1,24 @@
+{
+  "name": "pi-mem",
+  "version": "0.1.0",
+  "description": "ΠMem — 本地长期记忆库 for pi：每轮注入 + 自动总结 + 主动检索。SQLite + ONNX，无 GPU 依赖。",
+  "keywords": [
+    "pi-package",
+    "memory",
+    "rag",
+    "local-first"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "pi": {
+    "extensions": [
+      "./memskill.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "displayName": "ΠMem"
+}

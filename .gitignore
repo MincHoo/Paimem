@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 本地数据（绝不入库）
+*.db
+*.db-wal
+*.db-shm
+models/
+.mem/
+mem.toml
+*.log
+pi-adapter.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
