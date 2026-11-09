@@ -191,6 +191,30 @@ python mem.py stats
 
 架构与设计决策见 `ARCHITECTURE.md`。
 
+## 卸载
+
+```bash
+python uninstall.py --purge    # 停服务 + 删 ~/.mem
+pi remove "<安装路径>"          # 从 pi 配置里移除
+```
+
+## 与 npm 上 pi-mem 的区别
+
+同名生态里已有一个 [`pi-mem`](https://github.com/georgebashi/pi-mem)（作者 georgebashi），思路不同：
+
+| | ΠMem | pi-mem |
+|---|---|---|
+| 抽取方式 | 嵌入 + 规则，**零 LLM 调用** | 每个 tool_result 起一个 pi 子进程做 LLM 抽取 |
+| 嵌入 | **本地 ONNX e5-small**，离线 | 需要 OpenAI 兼容的 `/v1/embeddings` API |
+| 存储 | SQLite 单文件 | LanceDB |
+| 注入位置 | stable 进 **system sections**（缓存零损失） | 每轮一条 message |
+| 记忆卫生 | 衰减 / 去重 / 冲突 / 图扩展 / 证据审计 | 会话摘要 + 观察 |
+| 检索粒度 | 单层，返回全文 | 三层：index → timeline → details |
+| 项目隔离 | cwd / scope | git remote |
+
+**取舍**：ΠMem 用零成本、离线换取了"不会自动观察每个工具调用"——写入靠 harvest 提示模型主动写。
+pi-mem 全自动，但每个工具调用都要一次 LLM，成本随工具使用量线性增长。
+
 ## License
 
 MIT
