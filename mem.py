@@ -52,6 +52,24 @@ DEFAULTS = {
     "quota.max_writes_per_minute": "5",
     "quota.max_searches_per_minute": "20",
     "quota.max_daily_writes": "300",
+    # 图与打分（换嵌入模型必须重测）
+    "graph.related": "0.88",
+    "graph.neardup": "0.97",
+    "graph.contradicts": "0.94",
+    "graph.hop_gamma": "0.85",
+    "graph.top_k": "5",
+    "graph.contra_k": "5",
+    "graph.max_add": "20",
+    "score.w_content": "0.50",
+    "score.w_tags": "0.20",
+    "score.w_keyword": "0.15",
+    "score.w_graph": "0.15",
+    "decay.self_factor": "0.9",
+    "activation.boost": "0.15",
+    "activation.half_life_min": "30",
+    "inject.stable_k": "8",
+    "inject.dynamic_k": "3",
+    "inject.tail_item_chars": "180",
 }
 
 CLAIM_HALFLIFE = {"fact": 35, "preference": 180, "decision": 90,
@@ -257,6 +275,37 @@ def db():
     return con
 
 
+def apply_tunables(cfg):
+    """把 mem.toml 里的可调项写回模块常量（换模型时必须重测这批阈值）"""
+    g = globals()
+    def num(key, name, cast=float):
+        v = cfg.get(key)
+        if v is None or v == "":
+            return
+        try:
+            g[name] = cast(v)
+        except Exception:
+            pass
+    num("graph.related", "GRAPH_RELATED")
+    num("graph.neardup", "GRAPH_NEARDUP")
+    num("graph.contradicts", "GRAPH_CONTRADICTS")
+    num("graph.hop_gamma", "GRAPH_HOP_GAMMA")
+    num("graph.top_k", "GRAPH_TOP_K", int)
+    num("graph.contra_k", "GRAPH_CONTRA_K", int)
+    num("graph.max_add", "GRAPH_MAX_ADD", int)
+    num("score.w_content", "W_CONTENT")
+    num("score.w_tags", "W_TAGS")
+    num("score.w_keyword", "W_KEYWORD")
+    num("score.w_graph", "W_GRAPH")
+    g["W_DENOM"] = W_CONTENT + W_TAGS + W_KEYWORD + W_GRAPH
+    num("decay.self_factor", "DECAY_SELF_FACTOR")
+    num("activation.boost", "ACTIVATION_BOOST")
+    num("activation.half_life_min", "ACTIVATION_HALFLIFE_MIN")
+    num("inject.stable_k", "STABLE_K", int)
+    num("inject.dynamic_k", "DYNAMIC_K", int)
+    num("inject.tail_item_chars", "TAIL_ITEM_CHARS", int)
+
+
 def init_db(con):
     con.executescript(SCHEMA)
     con.commit()
@@ -451,7 +500,7 @@ def cmd_add(a):
 
     # 冲突检测：同为事实，且（verified 不同 或 词面含相反语义）-> 标记 disputed
     conflict_with = None
-    if best >= 0.94 and best_id:   # 与图阈值一致：低于 0.94 不足以谈矛盾
+    if best >= GRAPH_CONTRADICTS and best_id:   # 与图阈值一致：低于 0.94 不足以谈矛盾
         old_v = con.execute("SELECT verified,status,claim_type,content FROM mem_items WHERE id=?",
                             (best_id,)).fetchone()
         if (old_v and old_v["status"] == "active"
@@ -550,13 +599,14 @@ def build_bm25(docs, k1=1.2, b=0.75):
 GRAPH_HOP_GAMMA = 0.85   # 每跳衰减：2 跳的路径强度 = w1 * w2 * 0.85^2
 
 
-def expand_graph(graph, seed_ids, depth=2, per_node=5, max_add=20, gamma=None):
+def expand_graph(graph, seed_ids, depth=2, per_node=5, max_add=None, gamma=None):
     """从种子做受限 BFS，返回 {id: 路径强度}
 
     路径强度 = 沿路各边权之积 × gamma^跳数。
     衰减只用于**打分**，不用于剪枝（剪枝看 per_node / max_add）。
     """
     gamma = GRAPH_HOP_GAMMA if gamma is None else gamma
+    max_add = GRAPH_MAX_ADD if max_add is None else max_add
     seen = set(seed_ids)
     frontier = [(sid, 1.0) for sid in seed_ids]
     out = {}
@@ -581,7 +631,7 @@ def expand_graph(graph, seed_ids, depth=2, per_node=5, max_add=20, gamma=None):
 
 
 def candidates(con, qv, scope, query="", include_cold=False, include_drafts=False,
-               top_n=30, expand=2, expand_seeds=5, expand_max=20):
+               top_n=30, expand=2, expand_seeds=5, expand_max=None):
     """① 候选生成：语义 top-N ∪ 图扩展（扩展项用 BM25 补 similarity）"""
     rows, vecs = load_vectors(con, scope=scope, include_cold=include_cold,
                               include_drafts=include_drafts)
@@ -598,6 +648,7 @@ def candidates(con, qv, scope, query="", include_cold=False, include_drafts=Fals
     if not graph:
         return sem
 
+    expand_max = GRAPH_MAX_ADD if expand_max is None else expand_max
     seeds = [r["id"] for r, _ in sem[:expand_seeds]]
     path = expand_graph(graph, seeds, depth=expand, max_add=expand_max)
     have = {r["id"] for r, _ in sem}
@@ -985,6 +1036,44 @@ search.default_k       默认 5    范围 1-20
 search.max_tokens      默认 1500 范围 300-8000
   单次检索注入的 token 上限。
 
+graph.related          默认 0.88 范围 0.75-0.95
+  建 related 边的基础相似度。真正成边还需要「共享标签」或 sim>=0.95。
+  ⚠️ 换嵌入模型必须重测：e5-small 中文无关内容就有 0.85-0.92。
+
+graph.neardup          默认 0.97 范围 0.90-0.999
+  判定近似重复（near_dup 边）。调低会把相关内容当重复。
+
+graph.contradicts      默认 0.94 范围 0.85-0.99
+  矛盾判定的相似度门槛（还要配合否定词/数字冲突启发式）。
+
+graph.hop_gamma        默认 0.85 范围 0.5-1.0
+  多跳路径的逐跳衰减。2 跳的强度 = 边权之积 × gamma^2。
+
+graph.top_k / contra_k 默认 5 / 5
+  每节点最多保留几条普通边 / 矛盾边。调大图会变密，检索变慢。
+
+graph.max_add          默认 20
+  单次检索最多从图扩展进来多少条。
+
+score.w_content        默认 0.50
+score.w_tags           默认 0.20
+score.w_keyword        默认 0.15
+score.w_graph          默认 0.15
+  四分量权重，会自动归一（分母 = 四项之和）。改一项其余不变即可。
+
+decay.self_factor      默认 0.9  范围 0.3-1.0
+  AI 自己写的记忆在衰减上再乘的系数（防回音壁）。
+  实测 0.33 会让自写记忆几乎检索不到，0.9 是折中。
+
+activation.boost       默认 0.15 范围 0-0.5
+activation.half_life_min 默认 30
+  短期激活：刚被检索过的记忆在此时间内提权，然后快速回落。
+
+inject.stable_k        默认 8   范围 3-12
+inject.dynamic_k       默认 3   范围 1-5
+inject.tail_item_chars 默认 180 范围 80-300
+  注入规模。stable 进 system（缓存友好），dynamic 进尾部（每轮付费）。
+
 quota.max_writes_per_minute  默认 5
 quota.max_searches_per_minute 默认 20
 quota.max_daily_writes       默认 300
@@ -1141,6 +1230,8 @@ def cmd_consolidate(a):
 
 GRAPH_RELATED = 0.88   # 基础门槛；真正成边还需要「共享标签」或 sim>=0.95
 GRAPH_NEARDUP = 0.97
+GRAPH_CONTRADICTS = 0.94
+GRAPH_MAX_ADD = 20
 GRAPH_CONTRA_K = 5      # 每节点最多留几条矛盾边
 GRAPH_TOP_K = 5
 GRAPH_REBUILD_NEW = 10
@@ -1200,7 +1291,7 @@ def cmd_graph(a):
             else:
                 continue      # 相似但无共同标签，不足以成边
             # 矛盾只在「高度相似」时才判
-            if sim >= 0.94 and (looks_contradictory(texts[i], texts[j])
+            if sim >= GRAPH_CONTRADICTS and (looks_contradictory(texts[i], texts[j])
                                 or numeric_conflict(texts[i], texts[j])):
                 etype = "contradicts"
             cand.append((ids[i], ids[j], etype, sim))

@@ -142,6 +142,34 @@ pi 启动 → 拉起 mem.py serve（预热 ~900ms）
 
 ---
 
+## 端点白名单
+
+记忆的写入权限按**实际连接的端点**判定，不按模型自报的名字。
+
+```toml
+# ~/.mem/mem.toml
+[[trust.endpoints]]
+endpoint = "http://127.0.0.1:11434"   # 只比前缀
+model_class = "large"                  # unknown / small / medium / large
+```
+
+| 情况 | `origin=self` 写入的结果 |
+|---|---|
+| 未登记 | `draft`（不进默认检索） |
+| 已登记 `unknown` / `small` | `draft` |
+| 已登记 `medium` | `active`，`verified=0` |
+| 已登记 `large` | `active`，`verified≤1` |
+| 任何端点 + `origin=tool` + 证据 | `active`，`verified=2` |
+
+`origin=self` 指模型自己写的；`origin=tool` 指工具实测；`origin=user` 指用户明说。
+
+**为什么按端点而不是按模型名**：模型自报不可信，同一端口后面换了模型系统感知不到。
+登记端点等于让换模型必须显式改配置。
+
+⚠️ 配置即信任：白名单防的是「无意降级」，不防恶意提权。远程端点请显式登记。
+
+---
+
 ## 配置
 
 | 环境变量 | 默认 | 说明 |
@@ -155,6 +183,15 @@ pi 启动 → 拉起 mem.py serve（预热 ~900ms）
 | `MEM_DRY_RUN` | — | `1` 只记录不注入 |
 | `MEM_DISABLE` | — | `1` 完全关闭 |
 | `MEM_PY` / `MEM_PY_PATH` | 自动探测 | Python 解释器 / mem.py 路径 |
+
+全部可调参数（相似度阈值、四分量权重、衰减、注入规模、配额）都在
+`~/.mem/mem.toml`，完整说明用：
+
+```bash
+python mem.py config describe
+```
+
+⚠️ **相似度阈值与嵌入模型绑定**，换模型必须重测，不能照抄。
 
 项目级配置 `<项目>/.pi/memskill.json`：
 
@@ -187,12 +224,9 @@ pi 启动 → 拉起 mem.py serve（预热 ~900ms）
 
 ## 安全边界
 
-- **端点白名单**：按 `scheme://host:port` 登记，不按模型自报。未登记端点写入一律 `draft`，不进默认检索。
 - **`revoked` 永不复活**：SQL 触发器强制。
 - **硬删除禁止**：只能软删除。
 - **服务只监听 127.0.0.1**：无鉴权，同机进程可访问。
-
-⚠️ 配置即信任：白名单防的是"无意降级"，不防恶意提权。远程端点请显式登记。
 
 ---
 

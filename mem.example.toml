@@ -12,6 +12,9 @@ backend = "onnx"          # 仅支持 onnx（无 torch 依赖）
 # 热度衰减半衰期（天）。调大=旧记忆留更久但噪音多；调小=更快沉底。
 # 建议：项目周期 2 周调 14；长期个人助手调 180。不建议低于 7。
 half_life_days = 35
+# AI 自己写的记忆在衰减上再乘一次（防回音壁）。
+# 0.33 会让自写记忆几乎检索不到，0.9 是实测折中。
+self_factor = 0.9
 # 低于此热度进冷区，不参与默认检索（--include-cold 可查）
 cold_threshold = 0.15
 # 被检索到时的复活分数
@@ -30,6 +33,35 @@ strict_evidence = false
 [search]
 default_k = 5
 max_tokens = 1500
+
+[graph]
+# ⚠️ 换嵌入模型必须重测这四个阈值。
+# e5-small 在中文上分布极压缩：无关内容 0.85-0.92，同义改写 0.985。
+related = 0.88        # 建 related 边（还需共享标签，或 sim>=0.95）
+neardup = 0.97        # 建 near_dup 边
+contradicts = 0.94    # 判矛盾（配合否定词/数字冲突）
+hop_gamma = 0.85      # 多跳逐跳衰减
+top_k = 5             # 每节点保留几条边
+contra_k = 5          # 每节点保留几条矛盾边
+max_add = 20          # 单次检索最多扩展进多少条
+
+[score]
+# 四分量权重，会自动归一。改一项即可，不用手动配平。
+w_content = 0.50
+w_tags = 0.20
+w_keyword = 0.15
+w_graph = 0.15
+
+[activation]
+# 刚被检索过的记忆短期提权，然后快速回落。
+# 作用：专注同一话题时，同一批记忆更容易反复出现。
+boost = 0.15          # 最多 +15%
+half_life_min = 30    # 30 分钟减半
+
+[inject]
+stable_k = 8          # 进 system 的长期记忆条数（缓存友好，贵在稳定）
+dynamic_k = 3         # 进尾部的当前相关条数（每轮付费）
+tail_item_chars = 180 # 尾部单条截断长度
 
 [quota]
 max_writes_per_minute = 5
