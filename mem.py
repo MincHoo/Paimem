@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -211,6 +212,26 @@ CREATE TABLE IF NOT EXISTS mem_sessions(
   drift INTEGER DEFAULT 0, reanchors INTEGER DEFAULT 0,
   last_query TEXT, created_at INTEGER, updated_at INTEGER
 );
+
+-- 会话段索引：摘要 + 指向磁盘原文的指针（不折叠上下文，只做旁路记录）
+CREATE TABLE IF NOT EXISTS mem_segments(
+  id TEXT PRIMARY KEY,
+  scope TEXT,                -- 域（通常等于会话所属项目）
+  session_id TEXT,
+  seq INTEGER,
+  title TEXT NOT NULL,
+  digest TEXT,
+  transcript TEXT,           -- 原文所在文件
+  first_id TEXT, last_id TEXT,   -- 指针：pi entry id 区间
+  turn_start INTEGER, turn_end INTEGER,
+  n_tok INTEGER,
+  files TEXT,                -- JSON 数组
+  cmds TEXT,                 -- JSON 数组
+  errors INTEGER DEFAULT 0,
+  vector BLOB,
+  created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_seg_scope ON mem_segments(scope, created_at);
 
 -- 会话锚点：每个会话开始写一条，短期工作记忆将来挂在这个锚点上
 CREATE TABLE IF NOT EXISTS mem_anchors(
@@ -1398,6 +1419,252 @@ def cmd_graph(a):
 
 
 
+
+# ---------------- 导入 pi-observational-memory 的观察/反思 ----------------
+# 数据来源：pi session JSONL 里的 custom 条目
+#   customType = "om.observations.recorded"  data.observations[]
+#   customType = "om.reflections.recorded"   data.reflections[]
+# 观察结构：{id, content, timestamp, relevance, sourceEntryIds[], tokenCount}
+# 反思结构：{id, content, supportingObservationIds[], tokenCount}
+OM_OBS = "om.observations.recorded"
+OM_REF = "om.reflections.recorded"
+OM_DROP = "om.observations.dropped"
+OM_RELEVANCE = {"low": 0.3, "medium": 0.5, "high": 0.7, "critical": 0.9}
+
+
+def _read_session_jsonl(path):
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def _om_collect(entries):
+    """折叠 om 的账本：观察/反思按 id 去重（先出现的赢），drop 是墓碑"""
+    obs, ref, dropped = {}, {}, set()
+    for e in entries:
+        if e.get("type") != "custom":
+            continue
+        ct = e.get("customType")
+        d = e.get("data") or {}
+        if ct == OM_OBS:
+            for o in d.get("observations") or []:
+                oid = str(o.get("id") or "")
+                if oid and oid not in obs:
+                    obs[oid] = o
+        elif ct == OM_REF:
+            for r in d.get("reflections") or []:
+                rid = str(r.get("id") or "")
+                if rid and rid not in ref:
+                    ref[rid] = r
+        elif ct == OM_DROP:
+            for oid in d.get("observationIds") or []:
+                dropped.add(str(oid))
+    return obs, ref, dropped
+
+
+def cmd_ingest(a):
+    cfg = load_config()
+    con = db(); init_db(con)
+    path = a.session_file
+    if not path or not os.path.exists(path):
+        print(json.dumps({"error": "no_session_file", "path": path}, ensure_ascii=False)); return
+
+    entries = _read_session_jsonl(path)
+    obs, ref, dropped = _om_collect(entries)
+    if not obs and not ref:
+        print(json.dumps({"error": "no_om_entries",
+                          "hint": "这个会话里没有 pi-observational-memory 的记录",
+                          "entries": len(entries)}, ensure_ascii=False)); return
+
+    # 已经导入过的：靠 evidence_ref = "om:<id>" 判断
+    seen = set()
+    for r in con.execute("SELECT evidence_ref FROM mem_items WHERE evidence_ref LIKE 'tool:om/%'"):
+        seen.add(r["evidence_ref"])
+
+    scope = a.scope or "global"
+    status_want = a.status
+    items = []
+    # 反思优先（更持久、更抽象）
+    for rid, r in ref.items():
+        ref_key = "tool:om/" + rid
+        if ref_key in seen:
+            continue
+        items.append({
+            "content": str(r.get("content") or "").strip(),
+            "claim_type": "fact", "importance": 0.7,
+            "tags": "om,reflection", "evidence": ref_key,
+            "source_ids": None,
+        })
+    for oid, o in obs.items():
+        if oid in dropped:
+            continue                      # 已被 om 的 dropper 删掉，不导入
+        ref_key = "tool:om/" + oid
+        if ref_key in seen:
+            continue
+        items.append({
+            "content": str(o.get("content") or "").strip(),
+            "claim_type": "observation",
+            "importance": OM_RELEVANCE.get(str(o.get("relevance") or "medium"), 0.5),
+            "tags": "om,observation",
+            "evidence": ref_key,
+            "source_ids": o.get("sourceEntryIds"),
+        })
+    items = [i for i in items if i["content"]]
+
+    if a.dry_run:
+        print(json.dumps({"dry_run": True, "count": len(items),
+                          "sample": [i["content"][:60] for i in items[:5]]},
+                         ensure_ascii=False, indent=2))
+        return
+
+    written, skipped = [], 0
+    for it in items:
+        ns = argparse.Namespace(
+            content=it["content"], scope=scope, claim_type=it["claim_type"],
+            origin="self", model="om", endpoint="",
+            evidence=it["evidence"], reproduce=None, force=True, quiet=True, actor="ingest",
+            session=(os.path.basename(path).split("_")[-1].replace(".jsonl", "") or None),
+            turn=None, allow_instruction=False, no_dedup=False,
+            assertion=None, tags=it["tags"], entities="",
+            importance=it["importance"],
+        )
+        try:
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):   # cmd_add 会打 JSON，这里要吞掉
+                cmd_add(ns)
+            written.append(it["content"][:50])
+        except Exception:
+            skipped += 1
+
+    # 指定要 active 的，导入后统一提升
+    if status_want == "active" and written:
+        con.execute("UPDATE mem_items SET status='active' WHERE scope=? AND evidence_ref LIKE 'tool:om/%'"
+                    " AND status='draft'", (scope,))
+        con.commit()
+
+    print(json.dumps({"ok": True, "scope": scope,
+                      "observations": len(obs), "reflections": len(ref),
+                      "dropped": len(dropped), "imported": len(written),
+                      "skipped": skipped, "status": status_want,
+                      "items": written[:8]}, ensure_ascii=False, indent=2))
+
+
+
+# ---------------- 会话段索引（C1：摘要 + 指针，不折叠） ----------------
+def _seg_vec(title, digest):
+    return embed(["passage: " + (title or "") + "。" + (digest or "")])[0]
+
+
+def cmd_segment(a):
+    con = db(); init_db(con)
+    sub = getattr(a, "segment_cmd", "list") or "list"
+
+    if sub == "add":
+        sid = a.session or ""
+        scope = a.scope or "global"
+        seq = con.execute("SELECT COALESCE(MAX(seq),0)+1 s FROM mem_segments WHERE session_id=?",
+                          (sid,)).fetchone()["s"]
+        vec = _seg_vec(a.title, a.digest)
+        seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
+        con.execute(
+            "INSERT INTO mem_segments(id,scope,session_id,seq,title,digest,transcript,"
+            "first_id,last_id,turn_start,turn_end,n_tok,files,cmds,errors,vector,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (seg_id, scope, sid, seq, a.title, a.digest or "", a.transcript or "",
+             a.first_id or "", a.last_id or "", a.turn_start or 0, a.turn_end or 0,
+             int(a.tokens or 0), a.files or "[]", a.cmds or "[]", int(a.errors or 0),
+             vec.tobytes(), int(time.time())))
+        con.commit()
+        print(json.dumps({"ok": True, "id": seg_id, "seq": seq, "scope": scope},
+                         ensure_ascii=False))
+        return
+
+    if sub == "list":
+        q = "SELECT id,scope,session_id,seq,title,n_tok,turn_start,turn_end,created_at FROM mem_segments"
+        params = []
+        if a.scope:
+            q += " WHERE scope=?"
+            params.append(a.scope)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(a.limit or 30))
+        rows = [dict(r) for r in con.execute(q, params)]
+        print(json.dumps({"segments": rows, "count": len(rows)}, ensure_ascii=False, indent=2))
+        return
+
+    if sub == "get":
+        r = con.execute("SELECT * FROM mem_segments WHERE id=?", (a.id,)).fetchone()
+        if not r:
+            print(json.dumps({"error": "not_found", "id": a.id}, ensure_ascii=False)); return
+        d = dict(r); d.pop("vector", None)
+        text = ""
+        if a.part and d.get("transcript"):
+            try:
+                import io as _io
+                with _io.open(d["transcript"], encoding="utf-8") as f:
+                    lines = [json.loads(x) for x in f if x.strip()]
+                ids = {d.get("first_id"), d.get("last_id")}
+                text = "\n".join(json.dumps(x, ensure_ascii=False) for x in lines
+                                 if x.get("id") in ids)
+            except Exception as e:
+                text = "读取失败: %s" % e
+        print(json.dumps({"segment": d, "text": text}, ensure_ascii=False, indent=2))
+        return
+
+    if sub == "activate":
+        """模拟会话开始时的域激活：用第一条用户消息检索所有段"""
+        qv = embed(["query: " + a.query])[0]
+        rows = con.execute("SELECT id,scope,session_id,title,digest,vector,created_at,"
+                           "turn_start,turn_end,n_tok FROM mem_segments").fetchall()
+        # 语义 + 关键词。纯余弦在 50 段规模下信号/噪声只差 0.01-0.03，
+        # 中文专名（"英文维基" vs "中文维基"）只能靠词面区分。
+        q_grams = ngrams(a.query)
+        raw = []
+        for r in rows:
+            v = np.frombuffer(r["vector"], dtype=np.float32)
+            sim = float(v @ qv)
+            kw = coverage(q_grams, (r["title"] or "") + " " + (r["digest"] or ""))
+            raw.append((sim, kw, r))
+        # 候选内 min-max：余弦窄带 0.86-0.93，词面 0-0.6，量纲不同必须先对齐
+        def norm(vals):
+            lo, hi = min(vals), max(vals)
+            span = hi - lo
+            return [(v - lo) / span if span > 1e-6 else 0.5 for v in vals]
+        n_sim = norm([x[0] for x in raw])
+        n_kw = norm([x[1] for x in raw])
+        scored = [(0.65 * ns + 0.35 * nk, x[2], x[0])
+                  for ns, nk, x in zip(n_sim, n_kw, raw)]
+        scored.sort(key=lambda t: -t[0])
+        top = scored[:int(a.k or 3)]
+
+        # 按域聚合
+        domains = {}
+        for sim, r, _cos in top:
+            d = domains.setdefault(r["scope"], {"scope": r["scope"], "score": 0.0, "segments": []})
+            d["score"] = max(d["score"], round(sim, 4))
+            d["segments"].append({"id": r["id"], "title": r["title"],
+                                  "score": round(sim, 4), "turns": [r["turn_start"], r["turn_end"]]})
+        out = {
+            "query": a.query,
+            "candidates": len(rows),
+            "domains": sorted(domains.values(), key=lambda x: -x["score"]),
+            "top": [{"id": r["id"], "scope": r["scope"], "title": r["title"],
+                     "score": round(sim, 4), "cos": round(cos, 4)} for sim, r, cos in top],
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
+
+    print(json.dumps({"error": "unknown_subcommand", "got": sub}, ensure_ascii=False))
+
+
 # ---------------- 会话锚点（短期工作记忆的挂载点） ----------------
 def cmd_anchor(a):
     con = db(); init_db(con)
@@ -2191,6 +2458,35 @@ def main():
     s.add_argument("--candidates", type=int, default=30)
     s.add_argument("--pretty", action="store_true")
     s.set_defaults(func=cmd_snapshot)
+
+    sg = sub.add_parser("segment", parents=[common])
+    sgs = sg.add_subparsers(dest="segment_cmd")
+    sga = sgs.add_parser("add")
+    sga.add_argument("--title", required=True)
+    sga.add_argument("--digest", default="")
+    sga.add_argument("--scope", default=None)
+    sga.add_argument("--session", default=None)
+    sga.add_argument("--transcript", default=None)
+    sga.add_argument("--first-id", dest="first_id", default=None)
+    sga.add_argument("--last-id", dest="last_id", default=None)
+    sga.add_argument("--turn-start", dest="turn_start", type=int, default=0)
+    sga.add_argument("--turn-end", dest="turn_end", type=int, default=0)
+    sga.add_argument("--tokens", type=int, default=0)
+    sga.add_argument("--files", default="[]")
+    sga.add_argument("--cmds", default="[]")
+    sga.add_argument("--errors", type=int, default=0)
+    sgl = sgs.add_parser("list"); sgl.add_argument("--scope", default=None); sgl.add_argument("--limit", type=int, default=30)
+    sgg = sgs.add_parser("get"); sgg.add_argument("id"); sgg.add_argument("--part", default=None)
+    sgc = sgs.add_parser("activate"); sgc.add_argument("--query", required=True); sgc.add_argument("-k", "--k", type=int, default=3)
+    sg.set_defaults(func=cmd_segment)
+
+    s = sub.add_parser("ingest", parents=[common])
+    s.add_argument("--session-file", dest="session_file", required=True,
+                   help="pi 会话 JSONL 路径")
+    s.add_argument("--scope", default=None)
+    s.add_argument("--status", default="draft", choices=["draft", "active"])
+    s.add_argument("--dry-run", dest="dry_run", action="store_true")
+    s.set_defaults(func=cmd_ingest)
 
     s = sub.add_parser("anchor", parents=[common])
     s.add_argument("--session", default=None)
