@@ -3545,7 +3545,7 @@ def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
     if not picked:
         return []
     age_days = (now - int(picked[0]["created_at"] or now)) / 86400.0
-    if max_age and age_days > max_age:
+    if max_age is not None and age_days > max_age:
         return []
     picked.reverse()
     out = []
