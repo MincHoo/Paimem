@@ -1953,7 +1953,17 @@ def _seg_enrich_one(con, cfg, seg, dry=False):
     try:
         d = json.loads(t[i:j + 1])
     except Exception as e:
-        return {"id": seg["id"], "error": "bad_json", "detail": str(e)[:120], "raw": t[:200]}
+        # 陈述写多了会被 max_tokens 截断成半个 JSON（实测约 1/11 概率）
+        # 给一次放宽预算的重试，比让这条段落成 enriched=0 强
+        raw2 = _llm_chat(cfg, [{"role": "system", "content": SEGMENT_PROMPT},
+                               {"role": "user", "content": text}], max_tokens=6000)
+        t = _r.sub(r"^```[a-zA-Z]*\s*", "", raw2.strip())
+        t = _r.sub(r"\s*```$", "", t)
+        i, j = t.find("{"), t.rfind("}")
+        try:
+            d = json.loads(t[i:j + 1])
+        except Exception:
+            return {"id": seg["id"], "error": "bad_json", "detail": str(e)[:120], "raw": t[:200]}
     title = str(d.get("title") or "").strip()[:40] or seg["title"]
     digest = str(d.get("digest") or "").strip()[:300]
     stmts = [s for s in (d.get("statements") or []) if isinstance(s, dict) and s.get("text")]
@@ -2256,6 +2266,68 @@ def cmd_segment_repair_turns(a):
     print("\n已修 %d 条" % len(fixed))
     return 0
 
+
+def _find_session_file(session_id, base=None):
+    """按会话 id 在 pi 的会话目录里找回原文路径；多个候选返回 None（不猜）。"""
+    if not session_id:
+        return None
+    base = base or os.path.expanduser(os.path.join("~", ".pi", "agent", "sessions"))
+    if not os.path.isdir(base):
+        return None
+    hits = []
+    for root, _dirs, files in os.walk(base):
+        for f in files:
+            if f.endswith(".jsonl") and session_id in f:
+                hits.append(os.path.join(root, f))
+    return hits[0] if len(hits) == 1 else None
+
+
+def cmd_segment_repair_transcript(a):
+    """给 transcript 为空的段回填会话原文路径（只有唯一候选才写，不猜）。"""
+    con = db(); init_db(con)
+    rows = con.execute(
+        "SELECT id,session_id,turn_start,turn_end,title,transcript FROM mem_segments"
+        " WHERE transcript IS NULL OR transcript='' ORDER BY created_at").fetchall()
+    if not rows:
+        print("没有需要回填 transcript 的段")
+        return 0
+    found, missing = [], []
+    for r in rows:
+        path = _find_session_file(r["session_id"])
+        if not path:
+            missing.append((r["id"], r["session_id"] or "(空)"))
+            continue
+        n_turns = 0
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if (e.get("message") or {}).get("role") == "user":
+                n_turns += 1
+        ok = 1 <= int(r["turn_start"] or 0) and int(r["turn_end"] or 0) <= n_turns
+        found.append((r["id"], path, r["turn_start"], r["turn_end"], n_turns, ok, (r["title"] or "")[:22]))
+    for sid, path, ts, te, n, ok, ttl in found:
+        print("  %s t%s-%s/%d轮 %s  %s  「%s」" % (sid, ts, te, n, "✓" if ok else "⚠ 轮次超界", os.path.basename(path)[-26:], ttl))
+    for sid, known in missing:
+        print("  %s  找不到唯一原文（session=%s），跳过" % (sid, known))
+    if not getattr(a, "apply", False):
+        print("\n以上为预演（加 --apply 才写库）")
+        return 0
+    n = 0
+    for sid, path, _ts, _te, _n, _ok, _ttl in found:
+        con.execute("UPDATE mem_segments SET transcript=? WHERE id=?", (path, sid))
+        con.execute("INSERT INTO mem_events(ts,action,item_id,actor,detail) VALUES(?,?,?,?,?)",
+                    (int(time.time()), "repair_transcript", sid, "cli",
+                     json.dumps({"path": path}, ensure_ascii=False)))
+        n += 1
+    con.commit()
+    print("\n已回填 %d 条（原文唯一候选）" % n)
+    return 0
+
 def cmd_segment(a):
     con = db(); init_db(con)
     sub = getattr(a, "segment_cmd", "list") or "list"
@@ -2389,6 +2461,9 @@ def cmd_segment(a):
                           "conflicts": conflicts[:5], "superseded": superseded},
                          ensure_ascii=False, indent=2))
         return
+
+    if sub == "repair-transcript":
+        return cmd_segment_repair_transcript(a)
 
     if sub == "repair-turns":
         return cmd_segment_repair_turns(a)
@@ -3580,6 +3655,9 @@ def main():
     sgf.add_argument("--no-enrich", dest="no_enrich", action="store_true",
                      help="只本地收口，不调 LLM（前台模式的关窗路径）")
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgt = sgs.add_parser("repair-transcript")
+    sgt.add_argument("--apply", action="store_true", help="真的写库（默认只预演）")
+    sgt.set_defaults(segment_cmd="repair-transcript")
     sgr = sgs.add_parser("repair-turns")
     sgr.add_argument("--apply", action="store_true", help="真的写库（默认只预演）")
     sgr.set_defaults(segment_cmd="repair-turns")
