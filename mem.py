@@ -2229,15 +2229,6 @@ def cmd_segment(a):
                               "hint": "改正后重新调用；确实要跳过用 --force"},
                              ensure_ascii=False, indent=2))
             return
-        # 同一轮最多 3 段：多次调用按主题拆段，超过直接拒绝（避免一次灌十几条）
-        if sid and (a.turn or 0) > 0:
-            used = con.execute(
-                "SELECT COUNT(*) c FROM mem_segments WHERE session_id=? AND turn_end=?",
-                (sid, a.turn)).fetchone()["c"]
-            if used >= 3 and not getattr(a, "force", False):
-                print(json.dumps({"ok": False,
-                                  "errors": ["本轮已写 %d 段，上限 3 段/轮；要再写请合并主题" % used]},
-                                 ensure_ascii=False)); return
         title = _seg_flat(d.get("title") or "", SEG_TITLE_CHARS) or "(未命名段)"
         digest = _seg_flat(d.get("digest") or "", SEG_DIGEST_CHARS)
         txt_all = " ".join(str(x.get("text")) for x in stmts)
@@ -2259,6 +2250,14 @@ def cmd_segment(a):
                 (seg_id, a.scope or "global", sid, nseq, title, digest, a.transcript or "",
                  a.last_entry_id or "", a.last_entry_id or "",
                  a.turn or 0, a.turn or 0, _seg_vec(title, digest).tobytes(), int(time.time())))
+            # 无开场状态（同一轮的第 2、3 次调用）也要接上会话链
+            prev = con.execute(
+                "SELECT id FROM mem_segments WHERE scope=? AND id<>? ORDER BY created_at DESC LIMIT 1",
+                (a.scope or "global", seg_id)).fetchone()
+            if prev:
+                con.execute("INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at)"
+                            " VALUES(?,?,?,?,?)",
+                            (prev["id"], seg_id, "continues", 1.0, int(time.time())))
             con.commit()
         con.execute("UPDATE mem_segments SET title=?,digest=?,statements=?,enriched=1,vector=?"
                     " WHERE id=?",
