@@ -2364,8 +2364,13 @@ def _maybe_sweep(con):
     except Exception:
         return 0
 
-def _seg_close(con, st, scope, last_id, turn_last, reason):
-    """把当前段落成一条 mem_segments，并和同域上一段建 continues 边"""
+def _seg_close(con, st, scope, last_id, turn_last, reason, allow_thin=False):
+    """把当前段落成一条 mem_segments，并和同域上一段建 continues 边
+
+    自动闭合（drift/cap/session_end）遇到"只有寒暄"的段直接丢弃：
+    没有原文、没有陈述、标题摘要合计不足 70 字的段，写进去只会占位，
+    还会被 [mem:last] 当成"上次收尾"。commit 路径不受此限（模型显式要写）。
+    """
     first_text = st["first_text"] or ""
     last_text = st["last_text"] or ""
     title = _seg_flat(first_text, SEG_TITLE_CHARS) or "(未命名段)"
@@ -2374,6 +2379,17 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
         digest = _seg_flat(first_text + " … " + last_text, SEG_DIGEST_CHARS)
     else:
         digest = _seg_flat(first_text, SEG_DIGEST_CHARS)
+    # 注意 st["transcript"] 存的是 **会话文件路径**，不是正文：必须真去切片量长度，
+    # 否则真实段（路径约 118 字）也会被当成"没原文"
+    try:
+        src_len = len(_seg_source_text(con, st))
+    except Exception:
+        src_len = 0
+    if (not allow_thin and src_len < 400 and len(title) + len(digest) < 70
+            and int(st["n_tok"] or 0) < 60):
+        con.execute("DELETE FROM mem_segment_state WHERE session_id=?", (st["session_id"],))
+        con.commit()
+        return None            # 纯寒暄/空段：不留痕
     seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
     # 压缩后宿主的轮次计数会回退（实测 23→2），落库前夹紧，别写出倒挂数据
     t_start = int(st["turn_start"] or 0)
@@ -2431,7 +2447,10 @@ def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0, transcri
     if drift or capped:
         closed = _seg_close(con, st, scope, entry_id, turn,
                             "drift" if drift else "cap")
+        # _seg_close 会删掉 state 行，闭合后一律重开
         _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens, transcript)
+        if closed is None:      # 旧段是寒暄段，已丢弃
+            return {"action": "thin_drop", "drift": round(sim, 3)}
         return {"action": "close", "closed": closed, "drift": round(sim, 3),
                 "new_seq": 1}
 
@@ -2664,7 +2683,8 @@ def cmd_segment(a):
         if st:
             closed = _seg_close(con, st, a.scope or st["scope"],
                                 a.last_entry_id or st["last_id"],
-                                a.turn or st["turn_last"], "turn_commit")
+                                a.turn or st["turn_last"], "turn_commit",
+                                allow_thin=True)
             seg_id = closed["id"]
         else:
             seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
@@ -2898,6 +2918,10 @@ def cmd_segment(a):
                 con.commit()
                 st = _seg_state(con, sid)
             closed = _seg_close(con, st, st["scope"], st["last_id"], st["turn_last"], "session_end")
+            if closed is None:
+                print(json.dumps({"ok": True, "closed": None, "skipped": "too_thin",
+                                  "hint": "这段只有寒暄/没有原文，未落库"},
+                                 ensure_ascii=False)); return
         if getattr(a, "no_enrich", False):
             print(json.dumps({"ok": True, "closed": closed, "enriched": 0,
                               "note": "--no-enrich：只收口，不调 LLM"},
