@@ -2295,6 +2295,27 @@ def _check_statements(d, stmts):
     return errs
 
 
+
+def _seg_find_duplicate(con, sid, title, digest, stmts_text, turn, thr=0.97):
+    """同一轮重复提交（模型重试/手抖）不该写出两个几乎一样的段。"""
+    if not sid:
+        return None
+    rows = con.execute(
+        "SELECT id,title,digest,statements,vector,turn_end FROM mem_segments"
+        " WHERE session_id=? ORDER BY created_at DESC LIMIT 3", (sid,)).fetchall()
+    if not rows:
+        return None
+    probe = _seg_vec_for_index(title, digest, stmts_text)
+    for r in rows:
+        if not r["vector"]:
+            continue
+        if turn and r["turn_end"] and abs(int(r["turn_end"]) - int(turn)) > 1:
+            continue
+        v = np.frombuffer(r["vector"], dtype=np.float32)
+        if float(v @ probe) >= thr:
+            return r["id"]
+    return None
+
 def _seg_close(con, st, scope, last_id, turn_last, reason):
     """把当前段落成一条 mem_segments，并和同域上一段建 continues 边"""
     first_text = st["first_text"] or ""
@@ -2581,6 +2602,16 @@ def cmd_segment(a):
                              ensure_ascii=False))
             return
         txt_all = " ".join(str(x.get("text")) for x in stmts)
+        try:
+            dup = _seg_find_duplicate(con, sid, title, digest, txt_all, a.turn or 0)
+        except Exception:
+            dup = None
+        if dup and not getattr(a, "force", False):
+            print(json.dumps({"ok": True, "duplicate": True, "skipped": "near_dup",
+                              "segment": {"id": dup, "title": title},
+                              "hint": "同一轮已收口过这段内容；要强制再写加 --force"},
+                             ensure_ascii=False))
+            return
         st = _seg_state(con, sid) if sid else None
         if st:
             closed = _seg_close(con, st, a.scope or st["scope"],
