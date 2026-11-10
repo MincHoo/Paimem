@@ -91,6 +91,7 @@ DEFAULTS = {
     "segment.w_kw": "0.50",
     "segment.max_turns": "15",
     "segment.max_tokens": "12000",
+    "segment.archive_days": "100",
     "llm.endpoint": "https://opencode.ai/inference/go/openai/v1",
     "llm.model": "deepseek-v4.1-flash",
     "llm.api_key": "",
@@ -465,6 +466,7 @@ def apply_tunables(cfg):
     num("segment.drift_threshold", "SEG_DRIFT")
     num("segment.max_turns", "SEG_MAX_TURNS", int)
     num("segment.max_tokens", "SEG_MAX_TOKENS", int)
+    num("segment.archive_days", "SEG_ARCHIVE_DAYS", int)
 
 
 def _ensure_col(con, table, col, decl):
@@ -483,6 +485,8 @@ def _ensure_col(con, table, col, decl):
 def init_db(con):
     con.executescript(SCHEMA)
     _ensure_col(con, "mem_segment_state", "transcript", "TEXT")
+    _ensure_col(con, "mem_segments", "last_hit", "INTEGER")    # 被注入/检索到的最后一次时间
+    _ensure_col(con, "mem_segments", "archived_at", "INTEGER")  # 归档标记（不删数据）
     con.commit()
 
 
@@ -2233,6 +2237,7 @@ def _promote_statements(con, seg, stmts, endpoint=""):
 SEG_DRIFT = 0.0           # 0 = 关闭漂移检测
 SEG_MAX_TURNS = 15        # 硬上限：段内最多多少轮
 SEG_MAX_TOKENS = 12000    # 硬上限：段内最多多少 token
+SEG_ARCHIVE_DAYS = 100    # 这么久没被注入/检索过的段标成 archived（不删数据）
 SEG_TITLE_CHARS = 40
 SEG_DIGEST_CHARS = 200
 
@@ -2315,6 +2320,49 @@ def _seg_find_duplicate(con, sid, title, digest, stmts_text, turn, thr=0.97):
         if float(v @ probe) >= thr:
             return r["id"]
     return None
+
+
+def _seg_touch(con, ids):
+    """段被真正用上时记一次命中（100 天未命中 -> 归档）"""
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return
+    ph = ",".join("?" * len(ids))
+    con.execute("UPDATE mem_segments SET last_hit=? WHERE id IN (%s)" % ph,
+                [int(time.time())] + ids)
+
+
+def _sweep_archived(con, days=None, apply=True):
+    """把 N 天没被用过（也没建满 N 天）的段标成 archived。删数据是另一个决定，这里只标记。"""
+    days = SEG_ARCHIVE_DAYS if days is None else int(days)
+    cutoff = int(time.time()) - days * 86400
+    rows = con.execute(
+        "SELECT id,title,created_at,COALESCE(last_hit,created_at) AS last_used"
+        " FROM mem_segments WHERE archived_at IS NULL"
+        "   AND COALESCE(last_hit,created_at) < ? ORDER BY last_used", (cutoff,)).fetchall()
+    if apply and rows:
+        con.execute("UPDATE mem_segments SET archived_at=?"
+                    " WHERE archived_at IS NULL AND COALESCE(last_hit,created_at) < ?",
+                    (int(time.time()), cutoff))
+        log_event(con, "segment_archive", None, "sweep", {"n": len(rows), "days": days})
+        con.commit()
+    return rows
+
+
+def _maybe_sweep(con):
+    """收口时顺手体检，一天最多一次（不放在读路径上）"""
+    try:
+        row = con.execute("SELECT value FROM config WHERE key='segment.last_sweep'").fetchone()
+        now = int(time.time())
+        if row and now - int(row["value"] or 0) < 86400:
+            return 0
+        n = len(_sweep_archived(con, apply=True))
+        con.execute("INSERT INTO config(key,value) VALUES('segment.last_sweep',?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+        con.commit()
+        return n
+    except Exception:
+        return 0
 
 def _seg_close(con, st, scope, last_id, turn_last, reason):
     """把当前段落成一条 mem_segments，并和同域上一段建 continues 边"""
@@ -2644,6 +2692,9 @@ def cmd_segment(a):
                     (title, digest, json.dumps(stmts, ensure_ascii=False),
                      _seg_vec_for_index(title, digest, txt_all).tobytes(), seg_id))
         con.commit()
+        n_arch = _maybe_sweep(con)
+        if n_arch:
+            say("🧠 归档 %d 段（%d 天未命中）" % (n_arch, SEG_ARCHIVE_DAYS), a.quiet)
         seg_row = con.execute("SELECT * FROM mem_segments WHERE id=?", (seg_id,)).fetchone()
         promoted = _promote_statements(con, seg_row, stmts, cfg.get("llm.endpoint") or "")
 
@@ -2696,6 +2747,28 @@ def cmd_segment(a):
                          ensure_ascii=False, indent=2))
         return
 
+    if sub == "archive":
+        if getattr(a, "undo", None):
+            n = con.execute("UPDATE mem_segments SET archived_at=NULL WHERE id=?",
+                            (a.undo,)).rowcount
+            con.commit()
+            print(json.dumps({"ok": bool(n), "unarchived": a.undo}, ensure_ascii=False))
+            return
+        rows = _sweep_archived(con, getattr(a, "days", None), apply=bool(a.apply))
+        for r in rows:
+            print("  %s  建 %.0f 天前  最后用到 %.0f 天前  「%s」" % (
+                r["id"],
+                (time.time() - (r["created_at"] or 0)) / 86400,
+                (time.time() - (r["last_used"] or 0)) / 86400,
+                (r["title"] or "")[:24]))
+        if not rows:
+            print("没有需要归档的段（%d 天阈值内都命中过）" % (SEG_ARCHIVE_DAYS if a.days is None else a.days))
+        elif not a.apply:
+            print(chr(10) + "以上为预演（加 --apply 才写库；只是打 archived_at，不删数据）")
+        else:
+            print(chr(10) + "已归档 %d 段（检索/注入不再返回，数据仍在库里）" % len(rows))
+        return
+
     if sub == "rm":
         """删掉一条段（连同它的边）。用于清理误收录的寒暄段/测试段。"""
         sid_rm = a.id
@@ -2732,7 +2805,7 @@ def cmd_segment(a):
         chars = int(getattr(a, "chars", 40) or 40)
         def _rows(only_enriched):
             sql = ("SELECT id,scope,session_id,title,digest,turn_start,turn_end,enriched "
-                   "FROM mem_segments WHERE 1=1")
+                   "FROM mem_segments WHERE archived_at IS NULL")
             params = []
             if only_enriched:
                 sql += " AND enriched=1"
@@ -2785,7 +2858,7 @@ def cmd_segment(a):
 
     if sub == "list":
         q = ("SELECT id,scope,session_id,seq,title,n_tok,turn_start,turn_end,enriched,"
-             "transcript<>'' AS has_src,created_at FROM mem_segments")
+             "transcript<>'' AS has_src,created_at,last_hit,archived_at FROM mem_segments")
         params = []
         if a.scope:
             q += " WHERE scope=?"
@@ -3520,10 +3593,10 @@ def _activate_domains(con, query, scope, k=3, min_score=0.5, sid=None,
     """用 query 找相关历史段，按域聚合。第一轮注入用。"""
     qv = embed(["query: " + query])[0]
     sql = ("SELECT id,scope,session_id,title,digest,statements,vector,created_at,"
-           "turn_start,turn_end FROM mem_segments")
+           "turn_start,turn_end FROM mem_segments WHERE archived_at IS NULL")
     params = []
     if scope and scope != "global":
-        sql += " WHERE scope IN (?, 'global')"
+        sql += " AND scope IN (?, 'global')"      # 前面已经有 WHERE archived_at IS NULL
         params.append(scope)
     rows = con.execute(sql, params).fetchall()
     if not rows:
@@ -3571,6 +3644,7 @@ def _activate_domains(con, query, scope, k=3, min_score=0.5, sid=None,
                     "score": round(sc, 3), "turns": [r["turn_start"], r["turn_end"]],
                     "session": r["session_id"],
                     "own": bool(sid) and r["session_id"] == sid})
+    _seg_touch(con, [x["id"] for x in out])
     return out
 
 
@@ -3586,7 +3660,7 @@ def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
     """
     max_age = SESSION_MAX_AGE_DAYS if max_age_days is None else max_age_days
     sql = ("SELECT id,session_id,seq,title,digest,turn_start,turn_end,statements,created_at,n_tok"
-           " FROM mem_segments WHERE enriched=1 AND session_id<>''"
+           " FROM mem_segments WHERE enriched=1 AND archived_at IS NULL AND session_id<>''"
            # 只要“有实质内容”的段：纯寒暄段（无陈述、几乎没内容）不能当上次收尾
            " AND (COALESCE(statements,'')<>'[]' OR COALESCE(n_tok,0)>=60)")
     params = []
@@ -3617,6 +3691,7 @@ def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
     if max_age is not None and age_days > max_age:
         return []
     picked.reverse()
+    _seg_touch(con, [r["id"] for r in picked])
     out = []
     for r in picked:
         stmts = []
@@ -4010,6 +4085,12 @@ def main():
     sgf.add_argument("--no-enrich", dest="no_enrich", action="store_true",
                      help="只本地收口，不调 LLM（前台模式的关窗路径）")
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
+    saga = sgs.add_parser("archive")
+    saga.add_argument("--days", type=int, default=None,
+                      help="多少天没命中就归档（默认 segment.archive_days=100）")
+    saga.add_argument("--apply", action="store_true", help="真的打标记（默认只预演）")
+    saga.add_argument("--undo", default=None, help="取消某一段的归档标记")
+    saga.set_defaults(segment_cmd="archive")
     sgm = sgs.add_parser("rm")
     sgm.add_argument("id")
     sgm.add_argument("--force", action="store_true", help="确认删除（不可恢复）")
