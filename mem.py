@@ -347,6 +347,57 @@ def numeric_conflict(a, b):
     return bool((na - nb) and (nb - na))
 
 
+_UNIT_RE = _re.compile(
+    r"(\d+(?:\.\d+)?)\s*(%|GB|MB|KB|TB|token|tokens|倍|万|千|秒|分钟|小时|天|轮|条|次|字|字符)?",
+    _re.I)
+
+
+def _num_units(text):
+    """把文本里的数字连同紧跟的单位抽出来：[(值, 单位)]"""
+    return [(float(m.group(1)), (m.group(2) or "").lower())
+            for m in _UNIT_RE.finditer(text or "")]
+
+
+def contradiction_verdict(a, b):
+    """判定两条高度相似的记忆到底是矛盾还是同一事实的两种说法。
+
+    返回 (verdict, reason)，verdict ∈ {'none', 'synonym', 'contradict'}。
+
+    关键前提：**矛盾必须是"同一句话、不同值"**，所以先看词面重合度。
+    全库 8 条 contradicts 边实测：唯一真矛盾（512 vs 256 token）重合度 0.94，
+    其余 7 条都是 0.10-0.41（同主题不同措辞）——见 docs 4b-5。
+    """
+    cov = max(coverage(ngrams(a), b), coverage(ngrams(b), a))
+    neg = looks_contradictory(a, b)
+    num = numeric_conflict(a, b)
+    # 短句是单条主张：否定词差 + 主题重叠就够判；长句要近乎同一句话
+    same_claim = cov >= 0.70 or (len(a) < 80 and len(b) < 80 and cov >= 0.35)
+    if not num and not neg:
+        return "none", ""
+    if num:
+        if not same_claim:
+            return "synonym", "restated(cov=%.2f)" % cov
+        why = []
+        for va, ua in _num_units(a):
+            for vb, ub in _num_units(b):
+                # 单位必须都有且相同才是同一属性（"4" vs "17" 这种不能对拍）
+                if not ua or ua != ub or va == vb:
+                    continue
+                if abs(va + vb - 100.0) <= 0.5:   # 互补：是同一事实的两面
+                    why.append("complementary")
+                    continue
+                hi = max(abs(va), abs(vb)) or 1.0
+                if abs(va - vb) / hi < 0.15:      # 舍入 / 粒度差异
+                    why.append("rounding")
+                    continue
+                return "contradict", "number"
+        # 数字说"同一事实"，压过否定词差（52.6% 没小节 vs 47.4% 有小节）
+        return "synonym", why[0] if why else "numeric_close"
+    if same_claim:
+        return "contradict", "negation"
+    return "none", ""
+
+
 def validate_evidence(ref, strict=False, reproduce=None):
     """返回 (ok, msg)"""
     if not ref:
@@ -602,12 +653,14 @@ def cmd_add(a):
         best, best_id = float(sims[i]), rows[i]["id"]
 
     dedup_hit = best >= fcfg(cfg, "write.dedup_sim") and best_id and not getattr(a, "no_dedup", False)
+    verdict, vreason = "none", ""
     if dedup_hit:
         old_content = con.execute("SELECT content FROM mem_items WHERE id=?",
                                   (best_id,)).fetchone()
-        if old_content and (looks_contradictory(old_content["content"], content)
-                            or numeric_conflict(old_content["content"], content)):
-            # 高相似但语义相反 / 关键数字不同 -> 不是重复，走冲突或新条
+        if old_content:
+            verdict, vreason = contradiction_verdict(old_content["content"], content)
+        if verdict == "contradict":
+            # 高相似但语义相反 / 数字真的打架 -> 不是重复，走冲突或新条
             dedup_hit = False
 
     if dedup_hit and best_id:
@@ -624,16 +677,18 @@ def cmd_add(a):
 
     # 冲突检测：同为事实，且（verified 不同 或 词面含相反语义）-> 标记 disputed
     conflict_with = None
+    synonym_with = None
     if best >= GRAPH_CONTRADICTS and best_id:   # 与图阈值一致：低于 0.94 不足以谈矛盾
         old_v = con.execute("SELECT verified,status,claim_type,content FROM mem_items WHERE id=?",
                             (best_id,)).fetchone()
         if (old_v and old_v["status"] == "active"
                 and old_v["claim_type"] == "fact" and a.claim_type == "fact"):
             # 置信度差异本身不是矛盾（v1 -> v2 是"被证实"，不是"被推翻"）
-            contra = looks_contradictory(old_v["content"], content)
-            num = numeric_conflict(old_v["content"], content)
-            if contra or num:
+            verdict, vreason = contradiction_verdict(old_v["content"], content)
+            if verdict == "contradict":
                 conflict_with = best_id
+            elif verdict == "synonym":
+                synonym_with = (best_id, vreason)
 
     mid = "mem-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
     if conflict_with:
@@ -651,6 +706,12 @@ def cmd_add(a):
     if conflict_with:
         con.execute("INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at) VALUES(?,?,?,?,?)",
                     (mid, conflict_with, "contradicts", 1.0, now))
+    elif synonym_with:
+        # 数字看着不同其实是同一事实（互补/舍入/单位不同）：只记一条弱相关边，不标 disputed
+        con.execute("INSERT INTO mem_edges(src_id,dst_id,etype,weight,created_at) VALUES(?,?,?,?,?)",
+                    (mid, synonym_with[0], "related", 0.7, now))
+        log_event(con, "numeric_synonym", mid, a.actor,
+                  {"with": synonym_with[0], "why": synonym_with[1]})
 
     # confirmed_by：工具实证（verified=2）落地时，回头确认同 scope 里
     # 低置信的旧断言。这是唯一不需要 LLM 就能建出来的"类型边"。
@@ -1023,6 +1084,45 @@ def cmd_search(a):
     print(json.dumps(out, ensure_ascii=False, indent=2 if a.pretty else None))
 
 
+def _edges_for(con, ids):
+    """给检索结果补上逻辑边：矛盾/被替换/被合并/实证。
+
+    边存在库里但检索不返回、等于 write-only；这个函数把它们变成模型能直接用的判断。
+    """
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    rows = con.execute(
+        "SELECT src_id,dst_id,etype,weight FROM mem_edges"
+        " WHERE etype IN ('contradicts','replaces','merges','confirmed_by')"
+        "   AND (src_id IN (%s) OR dst_id IN (%s))" % (ph, ph),
+        list(ids) + list(ids)).fetchall()
+    peers = set()
+    for r in rows:
+        peers.add(r["src_id"]); peers.add(r["dst_id"])
+    peers -= set(ids)
+    txt = {}
+    if peers:
+        ph2 = ",".join("?" * len(peers))
+        for r in con.execute("SELECT id,content FROM mem_items WHERE id IN (%s)" % ph2,
+                             list(peers)):
+            txt[r["id"]] = (r["content"] or "")[:80]
+    out, seen = {}, set()
+    for r in rows:
+        pairs = [(r["src_id"], r["dst_id"], r["etype"]),
+                 (r["dst_id"], r["src_id"],
+                  {"replaces": "replaced_by", "merges": "merged_into"}.get(r["etype"], r["etype"]))]
+        for me, peer, key in pairs:
+            if me not in ids or peer == me or (me, key, peer) in seen:
+                continue
+            seen.add((me, key, peer))
+            out.setdefault(me, {}).setdefault(key, []).append(
+                {"id": peer, "excerpt": txt.get(peer, ""),
+                 "w": round(float(r["weight"] or 0), 2)})
+    return out
+
+
 def cmd_get(a):
     con = db(); init_db(con)
     ids = [x for x in (getattr(a, "ids", "") or "").split(",") if x]
@@ -1031,13 +1131,21 @@ def cmd_get(a):
         for i in ids:
             r = con.execute("SELECT * FROM mem_items WHERE id=?", (i,)).fetchone()
             if r:
-                out.append({k: r[k] for k in r.keys() if k != "vector"})
+                d = {k: r[k] for k in r.keys() if k != "vector"}
+                e = _edges_for(con, [i]).get(i)
+                if e:
+                    d["edges"] = e
+                out.append(d)
         print(json.dumps({"items": out, "count": len(out)}, ensure_ascii=False, indent=2))
         return
     r = con.execute("SELECT * FROM mem_items WHERE id=?", (a.id,)).fetchone()
     if not r:
         print(json.dumps({"error": "not_found", "id": a.id}, ensure_ascii=False)); return
     d = {k: r[k] for k in r.keys() if k != "vector"}
+    e = _edges_for(con, [a.id]).get(a.id)
+    if e:
+        d["edges"] = e
+        con.commit()
     print(json.dumps(d, ensure_ascii=False, indent=2))
 
 
@@ -1105,6 +1213,90 @@ def cmd_supersede(a):
     con.commit()
     say(f"🧠 旧记忆已标记失效  {a.old} → {a.new}", a.quiet)
     print(json.dumps({"ok": True, "superseded": a.old, "by": a.new}, ensure_ascii=False))
+
+
+def cmd_restore(a):
+    """把被推翻/归档的一条记忆改回 active（推翻错了的安全阀）。
+
+    forget 是用户主动废弃，需 --force 才能恢复。
+    """
+    con = db(); init_db(con)
+    r = con.execute("SELECT id,status,superseded_by,revoked_at,content FROM mem_items WHERE id=?",
+                    (a.id,)).fetchone()
+    if not r:
+        print(json.dumps({"error": "not_found", "id": a.id}, ensure_ascii=False)); return
+    if r["revoked_at"] and not getattr(a, "force", False):
+        print(json.dumps({"error": "revoked_needs_force", "hint": "forget 过的需 --force"},
+                         ensure_ascii=False)); return
+    if r["status"] == "active" and not r["superseded_by"] and not r["revoked_at"]:
+        print(json.dumps({"ok": True, "action": "noop", "id": a.id, "status": "active"},
+                         ensure_ascii=False)); return
+    prev_status, prev_by = r["status"], r["superseded_by"] or ""
+    con.execute("UPDATE mem_items SET status='active', superseded_by=NULL, valid_to=NULL,"
+                " revoked_at=NULL, cold=0 WHERE id=?", (a.id,))
+    # 删掉"被替换/被合并"的方向边，否则图里还写着它已经被取代
+    con.execute("DELETE FROM mem_edges WHERE dst_id=? AND etype IN ('replaces','merges')", (a.id,))
+    log_event(con, "restore", a.id, a.actor,
+              {"from": prev_status, "superseded_by": prev_by})
+    con.commit()
+    say(f"🧠 已恢复  {a.id}  ({prev_status} → active)", a.quiet)
+    print(json.dumps({"ok": True, "restored": a.id, "from": prev_status,
+                      "was_superseded_by": prev_by or None}, ensure_ascii=False))
+
+
+def cmd_repair_edges(a):
+    """按新判别器回放已有边：错判的 contradicts 降级，自环/悬空边清掉。
+
+    背景：旧规则「数字不同即矛盾」在 8 条边里只有 1 条成立（docs 4b-5）。
+    """
+    con = db(); init_db(con)
+    item_ids = {r[0] for r in con.execute("SELECT id FROM mem_items")}
+    seg_ids = {r[0] for r in con.execute("SELECT id FROM mem_segments")}
+    known = item_ids | seg_ids
+    rows = con.execute("SELECT src_id,dst_id,etype,weight FROM mem_edges").fetchall()
+    drop, demote, keep = [], [], 0
+    for r in rows:
+        if r["src_id"] == r["dst_id"]:
+            drop.append((r["src_id"], r["dst_id"], r["etype"], "self_loop"))
+            continue
+        if r["src_id"] not in known or r["dst_id"] not in known:
+            drop.append((r["src_id"], r["dst_id"], r["etype"], "dangling"))
+            continue
+        if r["etype"] != "contradicts":
+            continue
+        sa = con.execute("SELECT content FROM mem_items WHERE id=?", (r["src_id"],)).fetchone()
+        db_ = con.execute("SELECT content FROM mem_items WHERE id=?", (r["dst_id"],)).fetchone()
+        if not sa or not db_:
+            drop.append((r["src_id"], r["dst_id"], r["etype"], "not_item"))
+            continue
+        verdict, why = contradiction_verdict(sa["content"], db_["content"])
+        if verdict == "contradict":
+            keep += 1
+        elif verdict == "synonym":
+            demote.append((r["src_id"], r["dst_id"], "related", why))
+        else:
+            drop.append((r["src_id"], r["dst_id"], r["etype"], why or "not_same_claim"))
+    print("contradicts 保留 %d 条，降级为 related %d 条，删除 %d 条；另清自环/悬空 %d 条"
+          % (keep, len(demote), len([d for d in drop if d[3] not in ("self_loop", "dangling", "not_item")]),
+             len([d for d in drop if d[3] in ("self_loop", "dangling", "not_item")])))
+    for s, d, et, why in demote:
+        print("  降级 %s ↔ %s  (%s)" % (s, d, why))
+    for s, d, et, why in drop:
+        print("  删除 %s → %s  %s (%s)" % (s, d, et, why))
+    if not getattr(a, "apply", False):
+        print("\n以上为预演（加 --apply 才写库）")
+        return 0
+    for s, d, _et, _why in demote:
+        con.execute("UPDATE mem_edges SET etype='related', weight=0.7 WHERE src_id=? AND dst_id=?",
+                    (s, d))
+    for s, d, et, why in drop:
+        con.execute("DELETE FROM mem_edges WHERE src_id=? AND dst_id=? AND etype=?", (s, d, et))
+        log_event(con, "edge_drop", s, a.actor, {"to": d, "etype": et, "why": why})
+    log_event(con, "repair_edges", None, a.actor,
+              {"demoted": len(demote), "dropped": len(drop), "kept": keep})
+    con.commit()
+    print("\n已写库：降级 %d，删除 %d" % (len(demote), len(drop)))
+    return 0
 
 
 def cmd_forget(a):
@@ -1577,15 +1769,15 @@ def cmd_graph(a):
             ti = set(x.strip() for x in (rows[i]["tags"] or "").replace("，", ",").split(",") if x.strip())
             tj = set(x.strip() for x in (rows[j]["tags"] or "").replace("，", ",").split(",") if x.strip())
             share_tag = bool(ti & tj)
+            verdict, _why = contradiction_verdict(texts[i], texts[j])
             if sim >= GRAPH_NEARDUP:
-                etype = "near_dup"
+                etype = "near_dup" if verdict != "contradict" else "contradicts"
             elif share_tag or sim >= 0.95:
                 etype = "related"
             else:
                 continue      # 相似但无共同标签，不足以成边
-            # 矛盾只在「高度相似」时才判
-            if sim >= GRAPH_CONTRADICTS and (looks_contradictory(texts[i], texts[j])
-                                or numeric_conflict(texts[i], texts[j])):
+            # 矛盾只在「高度相似」且判别器说真打架时才判
+            if sim >= GRAPH_CONTRADICTS and verdict == "contradict":
                 etype = "contradicts"
             cand.append((ids[i], ids[j], etype, sim))
 
@@ -2425,10 +2617,9 @@ def cmd_segment(a):
                 if r2["id"] == p["id"] or sc < 0.45:
                     continue
                 why = []
-                if numeric_conflict(r2["content"], p["text"]):
-                    why.append("number")
-                if looks_contradictory(r2["content"], p["text"]):
-                    why.append("negation")
+                verdict, vreason = contradiction_verdict(r2["content"], p["text"])
+                if verdict == "contradict":
+                    why.append(vreason or "number")
                 if not why:
                     continue
                 conflicts.append({"old": r2["id"], "new": p["id"],
@@ -2980,6 +3171,8 @@ def cmd_serve(a):
 
     LAST_REQ = [time.time()]
     START_TS = time.time()
+    # 启动时快照自己的代码 mtime：宿主据此判断这个常驻进程是不是旧代码
+    START_CODE_MTIME = int(os.path.getmtime(os.path.abspath(__file__)))
 
     BASE = dict(quiet=True, actor="daemon", pretty=False, force=True, json=True,
                 scope=None, candidates=30, k=0, max_tokens=0,
@@ -3005,7 +3198,7 @@ def cmd_serve(a):
             return {"ok": True, "active": n, "pid": os.getpid(),
                     "home": os.path.abspath(HOME_PATH),
                     # 宿主据此判断常驻进程里的代码是不是比磁盘上的旧
-                    "py_mtime": int(os.path.getmtime(os.path.abspath(__file__))),
+                    "py_mtime": int(START_CODE_MTIME),
                     "started": int(START_TS)}
         if path == "/shutdown":
             # 代码换了以后，宿主让旧常驻进程自己退，下一轮自然起新的
@@ -3558,6 +3751,15 @@ def main():
     s.add_argument("id"); s.add_argument("--force", action="store_true")
     s.add_argument("--reason", default="")
     s.set_defaults(func=cmd_forget)
+
+    s = sub.add_parser("restore", parents=[common])
+    s.add_argument("id")
+    s.add_argument("--force", action="store_true", help="连 forget 过的也恢复")
+    s.set_defaults(func=cmd_restore)
+
+    s = sub.add_parser("repair-edges", parents=[common])
+    s.add_argument("--apply", action="store_true", help="真的写库（默认只预演）")
+    s.set_defaults(func=cmd_repair_edges)
 
     s = sub.add_parser("decay", parents=[common]); s.set_defaults(func=cmd_decay)
     s = sub.add_parser("stats", parents=[common]); s.set_defaults(func=cmd_stats)
