@@ -373,6 +373,6 @@ deepseek-v4.1-flash（opencode-go）：miss $0.15/M，hit $0.003/M（1/50）。
 读会话 JSONL 里 `message.usage` 的 `input` / `cacheRead`。
 `cacheRead` 卡在某个固定值 = 失效点在该位置。
 
-详见 `文档/方法论-实验与测量.md`。
+详见 `docs/方法论-实验与测量.md`。
 
 ---
