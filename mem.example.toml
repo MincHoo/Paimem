@@ -64,10 +64,24 @@ dynamic_k = 3         # 进尾部的当前相关条数（每轮付费）
 tail_item_chars = 180 # 尾部单条截断长度
 
 [harvest]
-# 会话结束后异步总结。提取是纯 CPU 规则，不调模型。
+# ⚠️ 2026-11-10 起废除后台路径：harvest 与 L2 enrich 不再自动触发。
+# 下列参数仅在使用 `python mem.py harvest` 手动总结时有效。
 max_per_session = 5   # 每个会话最多落几条
 sim_skip = 0.90       # 与现有记忆相似度超过此值视为已覆盖
 stale_min = 5         # 心跳超过这么多分钟没更新，视为僵死任务，下次 --drain 重跑
+
+[segment]
+# 段索引（工作记忆）。前台模式下由模型每轮调 mem_turn_close 写入。
+drift_threshold = 0     # 0 = 关闭漂移检测（实测不可用：真实边界 0.862 vs 段内 0.827）
+max_turns = 15          # 硬上限：段内最多多少轮
+max_tokens = 12000      # 硬上限：段内最多多少 token
+
+[llm]
+# 仅手动 enrich / 不入默认路径时使用
+endpoint = ""
+model = ""
+api_key = ""
+timeout = 180
 
 [quota]
 max_writes_per_minute = 5

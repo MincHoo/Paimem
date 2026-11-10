@@ -64,27 +64,20 @@ const MEM_PY = process.env.MEM_PY_PATH ?? join(PKG_DIR, "mem.py");
 const TIMEOUT = Number(process.env.MEM_TIMEOUT ?? 20000);
 const DRY = process.env.MEM_DRY_RUN === "1";
 const DISABLED = process.env.MEM_DISABLE === "1";
-let harvestEnabled = process.env.MEM_HARVEST !== "0";
-/** 写入记忆时声明的端点。留空 = 未登记 → 写入为 draft（更安全） */
-const ENDPOINT = process.env.MEM_ENDPOINT ?? "";
+const USE_DAEMON = process.env.MEM_DAEMON !== "0";
 /** 插件生效时要屏蔽的同名技能（避免"注入"和"技能"两套逻辑打架） */
 const HIDE_SKILL = process.env.MEM_HIDE_SKILL ?? "memory";
 /** 当前 scope 没有记忆时回退到哪个 scope */
 const FALLBACK_SCOPE = process.env.MEM_SCOPE_FALLBACK ?? "global";
-const USE_DAEMON = process.env.MEM_DAEMON !== "0";
+/** 写入记忆时声明的端点。留空 = 未登记 → 写入为 draft（更安全） */
+const ENDPOINT = process.env.MEM_ENDPOINT ?? "";
 const PORT = Number(process.env.MEM_PORT ?? 7788);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const MEM_HOME = process.env.MEM_HOME ?? join(homedir(), ".mem");
 const LOG_PATH = join(MEM_HOME, "pi-adapter.log");
-/** 上次会话没总结的标记 */
-const PENDING_PATH = join(MEM_HOME, "pending.json");
 
 // ---- 触发阈值（实测：本会话 123 轮 / 453K token / 平均 3.7K 每轮）----
-/** 会话转录落盘目录，供 detached 的 harvest 进程读取 */
-const TRANSCRIPT_DIR = join(MEM_HOME, "transcripts");
-/** 会话结束时，至少这么多字符才值得入队（太短的会话没什么可总结的） */
-const HARVEST_MIN_CHARS = Number(process.env.MEM_HARVEST_MIN_CHARS ?? 2_000);
 const CHARS_PER_TOKEN = 3.3;
 
 type RetrieveOut = {
@@ -138,14 +131,15 @@ const stats: Stats = {
 let enabled = !DISABLED;
 let scope = process.env.MEM_SCOPE ?? "default";
 let injectedIds: string[] = [];
-let pendingCompact = false;
 /** 上一轮累计 token，用来算本轮增量（段硬上限用） */
 let lastSegTokens = 0;
 /** 会话开始后的第一轮不计 token，避免基线对不齐 */
 let firstTurnAfterStart = true;
 let skillHidden = false;
-/** 上次会话遗留的未总结信息（开窗时读，第一轮消费后删除） */
-let pendingInfo: { turns: number; tokens: number; ts: number } | null = null;
+/** 上一轮是否调用过 mem_turn_close（前台模式的漏记提醒用） */
+let commitNudged = false;
+/** 压缩成功后置位：下一轮补一次段指针块（一次性） */
+let pendingSegIndex = false;
 /** 当前会话 id，供 harvest 命令带上 --session */
 let currentSid = "";
 
@@ -236,6 +230,9 @@ async function callDaemon(path: string, body: unknown): Promise<any | null> {
 }
 
 /** 直接跑 mem.py 子命令并解析 JSON（不走常驻服务） */
+// 前台模式：模型自己收口/摘要/比对，后台只保留本地收口（MEM_FOREGROUND_ONLY=0 可回滚）
+const FOREGROUND_ONLY = process.env.MEM_FOREGROUND_ONLY !== "0";
+
 async function runPy(args: string[]): Promise<any | null> {
 	try {
 		const py = await resolvePython();
@@ -350,93 +347,7 @@ function scanSession(entries: any[]): { turns: number; chars: number } {
 	return { turns, chars };
 }
 
-function lastHarvest(entries: any[]): { turn: number; tokens: number } {
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const e = entries[i];
-		if (e.type === "custom" && e.customType === "mem_harvest" && e.data) {
-			return { turn: e.data.turn ?? 0, tokens: e.data.tokens ?? 0 };
-		}
-	}
-	return { turn: 0, tokens: 0 };
-}
 
-function harvestCmd(sid?: string): string {
-	return (
-		`python "${MEM_PY}" add "<一句话事实>" --scope ${scope} --origin self` +
-		(ENDPOINT ? ` --endpoint ${ENDPOINT}` : "") +
-		(sid ? ` --session ${sid}` : "") +
-		` --claim-type <fact|preference|decision|procedure|observation>`
-	);
-}
-
-function harvestLine(turn: number, tokensK: number, reason: string): string {
-	const cmd = harvestCmd(currentSid);
-	return (
-		`[mem:harvest] 第 ${turn} 轮 / 约 ${tokensK}K token（${reason}）。` +
-		`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${cmd}` +
-		`；若发现旧记忆已过时，先 add --no-dedup 写新的，再 supersede <旧id> <新id> 更正。`
-	);
-}
-
-/** 把会话导出成 harvest 进程能读的 JSON。只留文字，不要 thinking 和工具参数。 */
-function dumpTranscript(entries: any[], sid: string, scope: string, cwd: string): {
-	path: string; chars: number; turns: number;
-} {
-	const messages: Array<{ role: string; text: string }> = [];
-	let chars = 0;
-	let turns = 0;
-	for (const e of entries) {
-		if (e.type === "custom_message" || e.type === "custom") continue;
-		const m = e.message;
-		if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
-		if (m.role === "user") turns++;
-		let text = "";
-		const c = m.content;
-		if (typeof c === "string") text = c;
-		else if (Array.isArray(c)) {
-			for (const b of c) {
-				if (!b || typeof b !== "object") continue;
-				if (typeof b.text === "string") text += b.text + "\n";
-			}
-		}
-		text = text.trim();
-		if (!text) continue;
-		chars += text.length;
-		messages.push({ role: m.role, text });
-	}
-	const path = join(TRANSCRIPT_DIR, `${sid || "anon"}-${Date.now()}.json`);
-	try {
-		mkdirSync(TRANSCRIPT_DIR, { recursive: true });
-		writeFileSync(
-			path,
-			JSON.stringify({ session: sid, scope, cwd, turns, ts: Date.now(), messages }),
-			"utf8",
-		);
-	} catch {
-		return { path: "", chars: 0, turns: 0 };
-	}
-	return { path, chars, turns };
-}
-
-/**
- * 拉起一个脱离父进程的 harvest 进程。
- * detached + stdio:ignore + unref 三件套：pi 退出后它继续跑完，
- * 中途被杀则由队列里的 running + 心跳超时在下次 --drain 时续跑。
- */
-function spawnHarvest(args: string[]): boolean {
-	try {
-		const child = spawn(pyBin, [MEM_PY, "harvest", ...args], {
-			detached: true,
-			stdio: "ignore",
-			windowsHide: true,
-			env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-		});
-		child.unref();
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
@@ -464,7 +375,6 @@ export default function (pi: ExtensionAPI) {
 		stats.viaDaemon = 0;
 		stats.viaSpawn = 0;
 		injectedIds = [];
-		pendingCompact = false;
 		lastSegTokens = 0;
 		firstTurnAfterStart = true;
 		try {
@@ -473,20 +383,9 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			/* ignore */
 		}
-		pendingInfo = null;
-		try {
-			if (existsSync(PENDING_PATH)) {
-				const p = JSON.parse(readFileSync(PENDING_PATH, "utf8"));
-				if (p && Date.now() - (p.ts ?? 0) < 7 * 86400_000) pendingInfo = p;
-				else unlinkSync(PENDING_PATH);
-			}
-		} catch {
-			/* ignore */
-		}
 		const cwd = ctx.sessionManager.getCwd?.() ?? process.cwd();
 		const cfg = loadConfig(cwd);
 		if (cfg.enabled === false) enabled = false;
-		if (typeof cfg.harvest === "boolean") harvestEnabled = cfg.harvest;
 		if (typeof cfg.scope === "string" && cfg.scope) scope = cfg.scope;
 		else scope = resolveScope(cwd);
 		// 会话锚点：短期工作记忆将来挂在这里。
@@ -509,12 +408,6 @@ export default function (pi: ExtensionAPI) {
 					anchorId: anchor.anchor ?? null,
 				});
 				stats.anchorId = anchor.anchor ?? null;
-				if (anchor.pending_drafts > 0) {
-					pendingInfo = {
-						...((pendingInfo as any) ?? {}),
-						autoDrafts: anchor.pending_drafts,
-					} as any;
-				}
 			}
 		} catch (e) {
 			await log({ t: Date.now(), event: "anchor_error", err: String(e) });
@@ -522,50 +415,36 @@ export default function (pi: ExtensionAPI) {
 
 		// 上次可能有没跑完的总结任务（关机、崩溃、杀进程）→ 补跑
 		// detached 拉起，不阻塞会话启动；队列里 pending / 心跳超时的 running 都会被捡起来
-		if (harvestEnabled) {
-			const ok = spawnHarvest(["--drain"]);
-			await log({ t: Date.now(), event: "harvest_recover", ok });
-		}
-		// 后台拉起常驻服务，不阻塞会话启动
+		// 后台拉起常驻服务，不阻塞会话启动（不再有 harvest 补跑）
 		if (enabled && USE_DAEMON && !daemonReady) daemonReady = ensureDaemon();
+	});
+
+	// 压缩成功 → 下一轮补一次段指针（放 tail，不进 system：压缩已把前缀作废，这里是天然 miss 点）
+	pi.on("session_compact", async (event, _ctx) => {
+		if (!enabled) return;
+		pendingSegIndex = true;
+		await log({ t: Date.now(), event: "compact_done", reason: event.reason,
+			willRetry: event.willRetry });
 	});
 
 	// 插件退出 / 重载 / 切会话 → 关掉服务
 	pi.on("session_shutdown", async (event, ctx) => {
-		// 会话结束 = 总结的锚点。入队（快，毫秒级），然后交给 detached 进程跑。
-		if (harvestEnabled && (event.reason === "quit" || event.reason === "reload")) {
-			try {
-				const entries = ctx.sessionManager.getEntries();
-				const cwd = ctx.sessionManager.getCwd?.() ?? process.cwd();
-				const sid = currentSid || "anon";
-				const { path, chars, turns } = dumpTranscript(entries, sid, scope, cwd);
-				const lh = lastHarvest(entries);
-				const sinceLast = chars - (lh.tokens ?? 0) * CHARS_PER_TOKEN;
-				if (path && chars >= HARVEST_MIN_CHARS) {
-					const ok = spawnHarvest([
-						"--transcript", path, "--scope", scope, "--session", sid,
-					]);
-					await log({
-						t: Date.now(), event: "harvest_spawn", sid, turns,
-						chars, sinceLast: Math.round(sinceLast), ok,
-					});
-					if (!ok) {
-						writeFileSync(
-							PENDING_PATH,
-							JSON.stringify({ turns, tokens: Math.round(chars / CHARS_PER_TOKEN), ts: Date.now() }),
-							"utf8",
-						);
-					}
-				}
-			} catch (e) {
-				await log({ t: Date.now(), event: "harvest_dump_error", err: String(e) });
-			}
-		}
 		// 段收口 + L2 升级：detached 跑，不阻塞退出
 		if (event.reason === "quit" || event.reason === "reload") {
-			try {
+				try {
 				const sid2 = currentSid || "anon";
-				const child = spawn(pyBin, [MEM_PY, "segment", "finalize", "--session", sid2], {
+				const sf = (() => {
+					try {
+						return (ctx.sessionManager as any).getSessionFile?.() ?? "";
+					} catch {
+						return "";
+					}
+				})();
+				const child = spawn(pyBin, FOREGROUND_ONLY
+					? [MEM_PY, "segment", "finalize", "--session", sid2, "--no-enrich",
+						...(sf ? ["--transcript", sf] : [])]
+					: [MEM_PY, "segment", "finalize", "--session", sid2,
+						...(sf ? ["--transcript", sf] : [])], {
 					detached: true,
 					stdio: "ignore",
 					windowsHide: true,
@@ -581,17 +460,6 @@ export default function (pi: ExtensionAPI) {
 		await log({ t: Date.now(), event: "shutdown", reason: event.reason });
 	});
 
-	pi.on("session_before_compact", async (event) => {
-		if (!harvestEnabled) return;
-		pendingCompact = true;
-		await log({
-			t: Date.now(),
-			event: "compact_before",
-			reason: event.reason,
-			tokensBefore: event.preparation?.tokensBefore,
-		});
-	});
-
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
 		if (event.messageType !== "user") return;
@@ -600,6 +468,14 @@ export default function (pi: ExtensionAPI) {
 
 		const sid = ctx.sessionManager.getSessionId();
 		currentSid = sid;
+		// 段原文指针：闭合段时写进 mem_segments，供 L2 摘要和 segment get 用
+		const sessionFile = (() => {
+			try {
+				return (ctx.sessionManager as any).getSessionFile?.() ?? "";
+			} catch {
+				return "";
+			}
+		})();
 		// 段跟踪：把轮次、当前 user 条目 id、本轮 token 估算一起传给 mem.py，
 		// 它在同一次调用里判断该不该切段，避免额外往返
 		const entriesForSeg = ctx.sessionManager.getEntries();
@@ -634,6 +510,7 @@ export default function (pi: ExtensionAPI) {
 			lastUserId,
 			"--turn-tokens",
 			String(turnTokens),
+			...(sessionFile ? ["--transcript", sessionFile] : []),
 			...(injectedIds.length ? ["--exclude-ids", injectedIds.join(",")] : []),
 		];
 		let out = (await runMem(args(scope), "/retrieve", {
@@ -643,6 +520,7 @@ export default function (pi: ExtensionAPI) {
 			turn: segTurns + 1,
 			entry_id: lastUserId,
 			turn_tokens: turnTokens,
+			transcript: sessionFile || undefined,
 			exclude_ids: injectedIds,
 		})) as RetrieveOut | null;
 		if (!out) return;
@@ -657,6 +535,7 @@ export default function (pi: ExtensionAPI) {
 				turn: segTurns + 1,
 				entry_id: lastUserId,
 				turn_tokens: turnTokens,
+				transcript: sessionFile || undefined,
 				exclude_ids: injectedIds,
 			})) as RetrieveOut | null;
 			if (fb && (fb.debug?.candidates ?? 0) > 0) {
@@ -665,6 +544,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		// 首次判断必须在 stats.turns++ 之前取，否则恒为 false（域激活永不生效）
+		const isFirstTurn = stats.turns === 0;
 		stats.turns++;
 		const cacheState = out.stable.cache ?? "empty";
 		if (cacheState === "new") stats.cacheNew++;
@@ -699,14 +580,11 @@ export default function (pi: ExtensionAPI) {
 		const { turns: prevTurns, chars } = scanSession(entries);
 		const turns = prevTurns + 1;
 		const tokens = Math.round(chars / CHARS_PER_TOKEN);
-		const lh = lastHarvest(entries);
-		let harvestReason = "";
-		if (harvestEnabled && pendingCompact) harvestReason = "压缩前";
 		// 第一轮：域激活（相关历史会话）
 		const doms = (out as any).domains as
 			| Array<{ id: string; scope: string; title: string; score: number }>
 			| null;
-		if (stats.turns === 0 && doms && doms.length) {
+		if (isFirstTurn && doms && doms.length) {
 			const list = doms.map((d) => `${d.id}「${d.title}」`).join("、");
 			const line =
 				`[mem:domains] 相关历史会话：${list}。` +
@@ -735,35 +613,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		if (harvestReason) {
-			const line = harvestLine(turns, Math.round(tokens / 1000), harvestReason);
-			tailText = tailText ? tailText + "\n\n" + line : line;
-			stats.harvests++;
-			pendingCompact = false;
+		// 压缩后第一轮：补一次段指针块（只一次，之后不再注入）
+		if (pendingSegIndex) {
+			pendingSegIndex = false;
 			try {
-				ctx.sessionManager.appendCustomEntry("mem_harvest", {
-					turn: turns,
-					tokens,
-					reason: harvestReason,
-				});
-			} catch {
-				/* ignore */
+				const b = await runPy(["segment", "brief", "--scope", scope, "--limit", "5"]);
+				if (b && b.text) {
+					tailText = tailText ? tailText + "\n\n" + b.text : b.text;
+					ctx.sessionManager.appendCustomEntry("mem_segindex", {
+						ids: b.ids, count: b.count, ts: Date.now(),
+					});
+					await log({ t: Date.now(), event: "seg_index_inject", n: b.count, chars: b.chars });
+				}
+			} catch (e) {
+				await log({ t: Date.now(), event: "seg_index_error", err: String(e).slice(0, 200) });
 			}
 		}
 
-		// 上次会话没总结 → 本轮补一句提醒
-		if (pendingInfo && stats.turns === 1) {
-			const line =
-				`[mem:harvest] 上次会话（${pendingInfo.turns} 轮 / 约 ${Math.round(pendingInfo.tokens / 1000)}K token）没总结。` +
-				`如有值得记忆的内容则记录 1~5 条，无则不记。命令：${harvestCmd(currentSid)}`;
+		// 前台模式：上一轮没调用 mem_turn_close → 提醒一句（冗噪控制：只在漏记时出现）
+		if (FOREGROUND_ONLY && !commitNudged && stats.turns > 1) {
+			const line = "[mem] 上一轮未收口。本轮结束前用 mem_turn_close 记录结论；无结论可跳过。";
 			tailText = tailText ? tailText + "\n\n" + line : line;
-			try {
-				unlinkSync(PENDING_PATH);
-			} catch {
-				/* ignore */
-			}
-			pendingInfo = null;
 		}
+		commitNudged = false;
 
 		const willInject = Boolean(tailText) && tailText !== stats.lastTail;
 		const tailBytes = willInject ? Buffer.byteLength(tailText, "utf8") : 0;
@@ -793,11 +665,12 @@ export default function (pi: ExtensionAPI) {
 			tailBytes,
 			dyn: out.tail.dynamic,
 			anchor: out.tail.anchor,
-			harvest: harvestReason || undefined,
 			skillHidden,
 			candidates: out.debug.candidates,
 			best: out.debug.best,
 			drift: out.debug.drift,
+			domains: Array.isArray((out as any).domains) ? (out as any).domains.length : 0,
+			firstTurn: isFirstTurn,
 			elapsedMs: out.debug.elapsedMs,
 			dry: DRY,
 		});
@@ -908,6 +781,148 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// 第三层：前台记录（收口 + 摘要 + 提升 + 比对，全部由主模型完成）
+	pi.registerTool({
+		name: "mem_turn_close",
+		label: "记忆收口",
+		description:
+			"把本轮对话收口成一条段索引并存入本地记忆库（仅本地磁盘，不占后续上下文）。" +
+			"一轮结束时调用一次；纯寒晦/确认可跳过。" +
+			"title 不超过 20 字，digest 不超过 120 字，statements 最多 12 条。" +
+			"每句陈述必须自足：主体明确、指代换成具体名词、保留原路径与数字；" +
+			"用户只说「可以/赞同」时，必须还原出他赞同的具体内容。" +
+			"只有项目级常识（本项目专属的参数/阈值/路径/技巧）才带项目名；通识不要带。" +
+			"若本轮推翻了旧记忆，在 supersedes 里给出 old_id 和完整新陈述。",
+		parameters: {
+			type: "object",
+			properties: {
+				title: { type: "string", description: "不超过 20 字，能当检索键" },
+				digest: { type: "string", description: "不超过 120 字，说清这段在干什么、结论是什么" },
+				statements: {
+					type: "array",
+					description: "自足陈述，最多 12 条；没有信息量就传空数组",
+					items: {
+						type: "object",
+						properties: {
+							text: { type: "string" },
+							kind: {
+								type: "string",
+								enum: ["decision", "constraint", "fact", "procedure", "rejected", "question", "preference"],
+							},
+							keywords: { type: "array", items: { type: "string" } },
+							confidence: { type: "string", enum: ["explicit", "inferred"] },
+						},
+						required: ["text", "kind"],
+					},
+				},
+				supersedes: {
+					type: "array",
+					description: "要推翻的旧记忆：[{old_id, text}]，text 为完整新陈述",
+					items: {
+						type: "object",
+						properties: { old_id: { type: "string" }, text: { type: "string" } },
+						required: ["old_id", "text"],
+					},
+				},
+			},
+			required: ["title", "digest"],
+		} as any,
+		async execute(_id: string, params: any, _sig: any, _upd: any, tctx: any) {
+			const entries = tctx?.sessionManager?.getEntries?.() ?? [];
+			const { turns } = scanSession(entries);
+			let lastEntryId = "";
+			for (let i = entries.length - 1; i >= 0; i--) {
+				if (entries[i]?.id) { lastEntryId = entries[i].id; break; }
+			}
+			let sf = "";
+			try {
+				sf = tctx?.sessionManager?.getSessionFile?.() ?? "";
+			} catch {
+				/* ignore */
+			}
+			const payload = JSON.stringify({
+				title: params.title,
+				digest: params.digest,
+				statements: params.statements ?? [],
+				supersedes: params.supersedes ?? [],
+			});
+			const argv = [
+				"segment", "commit",
+				"--session", currentSid || "anon",
+				"--scope", scope,
+				"--turn", String(turns),
+				"--last-entry-id", lastEntryId,
+				"--payload", payload,
+				...(sf ? ["--transcript", sf] : []),
+			];
+			const r = await runPy(argv);
+			if (!r) {
+				return { content: [{ type: "text", text: "记忆库不可用，本轮未写入" }], details: {} };
+			}
+			if (r.ok === false) {
+				return {
+					content: [{
+						type: "text",
+						text: "✗ 陈述不合格，请改写后重试：\n- " + (r.errors ?? []).join("\n- "),
+					}],
+					details: { errors: r.errors ?? [] },
+				};
+			}
+			commitNudged = true;
+			const seg = r.segment ?? {};
+			const lines = [`✓ 已收口 ${seg.id}｜${seg.title}（${seg.statements ?? 0} 条陈述）`];
+			if ((r.promoted ?? []).length) {
+				lines.push("已提升: " + r.promoted.map((p: any) => `${p.id}(${p.kind})`).join(", "));
+			}
+			if ((r.conflicts ?? []).length) {
+				lines.push("⚠ 可能冲突，确认后用 mem_supersede 处理:");
+				for (const c of r.conflicts) {
+					lines.push(`  - ${c.old}（${c.why.join("/")}，${c.score}）${c.old_text}`);
+				}
+			}
+			if ((r.superseded ?? []).length) {
+				lines.push("已推翻: " + r.superseded.map((x: any) => `${x.superseded}→${x.by}`).join(", "));
+			}
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { id: seg.id } };
+		},
+	});
+
+	pi.registerTool({
+		name: "mem_supersede",
+		label: "推翻旧记忆",
+		description:
+			"用一条更准确的新陈述推翻旧记忆，旧条会被标为 superseded 并建立 replaces 边。" +
+			"只在确认新旧不一致时用；只是补充细节用 mem_turn_close。",
+		parameters: {
+			type: "object",
+			properties: {
+				old_id: { type: "string", description: "要被推翻的记忆 id" },
+				text: { type: "string", description: "完整的新陈述（自足、无代词）" },
+				claim_type: { type: "string", enum: ["fact", "decision", "preference", "procedure"] },
+			},
+			required: ["old_id", "text"],
+		} as any,
+		async execute(_id: string, params: any) {
+			const argv = [
+				"supersede", String(params.old_id),
+				"--new-text", String(params.text),
+				"--session", currentSid || "anon",
+				...(params.claim_type ? ["--claim-type", String(params.claim_type)] : []),
+			];
+			const r = await runPy(argv);
+			if (!r || r.error) {
+				return {
+					content: [{ type: "text", text: "推翻失败: " + JSON.stringify(r?.error ?? "unavailable") }],
+					details: {},
+				};
+			}
+			return {
+				content: [{ type: "text", text: `✓ 已推翻 ${r.superseded} → ${r.by}` }],
+				details: { superseded: r.superseded, by: r.by },
+			};
+		},
+	});
+
 	pi.registerCommand("mem", {
 		description: "记忆库状态（/mem off 关闭、/mem on 开启）",
 		handler: async (args, ctx) => {
@@ -926,13 +941,13 @@ export default function (pi: ExtensionAPI) {
 			const live = await health(400);
 			ctx.ui.notify(
 				[
-					`状态: ${enabled ? "开启" : "关闭"}${DRY ? " (dry)" : ""}${harvestEnabled ? " +harvest" : ""}`,
+					`状态: ${enabled ? "开启" : "关闭"}${DRY ? " (dry)" : ""}`,
 					`scope: ${scope}`,
 					`技能: ${skillHidden ? `已屏蔽 ${HIDE_SKILL}（插件接管）` : "未屏蔽"}`,
 					`服务: ${live ? `常驻 (${BASE})` : "未运行（回退子进程）"}  daemon ${stats.viaDaemon} / spawn ${stats.viaSpawn}`,
 					`轮次: ${stats.turns}  (stable new ${stats.cacheNew} / hit ${stats.cacheHit})`,
 					`stable: ${stats.stableBytes}B  hash ${stats.lastHash ?? "-"}`,
-					`tail: 累计 ${stats.tailBytes}B / 注入 ${stats.injected} 次 / harvest ${stats.harvests} 次`,
+					`tail: 累计 ${stats.tailBytes}B / 注入 ${stats.injected} 次`,
 					`锚点: ${stats.anchorId ? "#" + stats.anchorId : "未写入"} / 会话 ${currentSid ?? "-"}`,
 					d
 						? `最近: ${d.candidates} 候选 best=${Number(d.best).toFixed(3)} drift=${d.drift} ${d.elapsedMs}ms`

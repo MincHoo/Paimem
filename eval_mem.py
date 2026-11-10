@@ -49,14 +49,46 @@ CASES = [
 ]
 
 
-def part_a(m, con, cfg, topk=10):
+BENCH_SCOPE = "evalbench"
+
+
+def snapshot_bench(m, con, scope=BENCH_SCOPE):
+    """把 13 条基准记忆复制到独立 scope，并刷新时间戳。
+
+    目的：库会持续长大，直接对 global 跑分会逐年下滑——那不是代码退化，
+    而是候选变多。固定快照后，分数只反映检索逻辑是否被改坏。
+    """
+    now = int(time.time())
+    made = []
+    for _q, want in CASES:
+        r = con.execute(
+            "SELECT content,claim_type,origin,verified,tags,importance,vector "
+            "FROM mem_items WHERE id=?", (want,)).fetchone()
+        if not r:
+            continue
+        nid = "bench-" + want
+        con.execute(
+            "INSERT OR REPLACE INTO mem_items(id,content,claim_type,origin,verified,"
+            "scope,tags,importance,n_tok,created_at,valid_from,status,hot_score,"
+            "hit_count,last_hit,cold,vector) VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',1,0,?,0,?)",
+            (nid, r["content"], r["claim_type"], r["origin"], r["verified"], scope,
+             r["tags"], r["importance"], max(1, len(r["content"] or "") // 3),
+             now, now, now, r["vector"]))
+        made.append(nid)
+    con.commit()
+    return made
+
+
+def part_a(m, con, cfg, topk=10, scope="global"):
     hits = {1: 0, 3: 0, 5: 0, 10: 0}
     rr = 0.0
     rows = []
     lat = []
     for q, want in CASES:
+        if scope == BENCH_SCOPE:
+            want = "bench-" + want
         t = time.time()
-        res = m._search_core(con, cfg, q, "global", 30)
+        res = m._search_core(con, cfg, q, scope, 30)
         lat.append((time.time() - t) * 1000)
         ids = [r["id"] for _, _, r in res[:topk]]
         rank = ids.index(want) + 1 if want in ids else 0
@@ -172,6 +204,10 @@ def part_b_echo(m, con, cfg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--scope", default="global",
+                    help="A 部分检索用的 scope（默认 global；固定尺子用 evalbench）")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="先把 13 条基准复制到 evalbench 快照，再跑分")
     a = ap.parse_args()
 
     m = load_mem()
@@ -179,7 +215,11 @@ def main():
     m.init_db(con)
     cfg = m.load_config()
 
-    A = part_a(m, con, cfg)
+    if a.snapshot:
+        made = snapshot_bench(m, con)
+        print(f"[snapshot] {len(made)} 条基准已写入 scope={BENCH_SCOPE}")
+        a.scope = BENCH_SCOPE
+    A = part_a(m, con, cfg, scope=a.scope)
     B1 = part_b_scope_leak(m, con, cfg)
     B2 = part_b_assertion(m, con, cfg)
     B3 = part_b_echo(m, con, cfg)
@@ -190,7 +230,7 @@ def main():
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
 
-    print("=== A. 真实集（13 条记忆 / 13 个查询）===")
+    print(f"=== A. 真实集（13 条记忆 / 13 个查询，scope={a.scope}）===")
     print(f"  Hit@1  {A['hit@1']:.0%}")
     print(f"  Hit@3  {A['hit@3']:.0%}")
     print(f"  Hit@5  {A['hit@5']:.0%}")

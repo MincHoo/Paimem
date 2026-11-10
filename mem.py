@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS mem_segment_state(
   turn_last INTEGER,
   n_turns INTEGER DEFAULT 0,
   n_tok INTEGER DEFAULT 0,
+  transcript TEXT,          -- 会话原文文件（段闭合时写给 mem_segments）
   opened_at INTEGER
 );
 
@@ -410,8 +411,22 @@ def apply_tunables(cfg):
     num("segment.max_tokens", "SEG_MAX_TOKENS", int)
 
 
+def _ensure_col(con, table, col, decl):
+    """SQLite 不会自动加列：老库补列，避免 DROP TABLE 丢数据"""
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
+    except Exception:
+        return
+    if cols and col not in cols:
+        try:
+            con.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
+        except Exception:
+            pass
+
+
 def init_db(con):
     con.executescript(SCHEMA)
+    _ensure_col(con, "mem_segment_state", "transcript", "TEXT")
     con.commit()
 
 
@@ -587,8 +602,10 @@ def cmd_add(a):
     if dedup_hit:
         old_content = con.execute("SELECT content FROM mem_items WHERE id=?",
                                   (best_id,)).fetchone()
-        if old_content and looks_contradictory(old_content["content"], content):
-            dedup_hit = False      # 高相似但语义相反 -> 走冲突分支
+        if old_content and (looks_contradictory(old_content["content"], content)
+                            or numeric_conflict(old_content["content"], content)):
+            # 高相似但语义相反 / 关键数字不同 -> 不是重复，走冲突或新条
+            dedup_hit = False
 
     if dedup_hit and best_id:
         con.execute("UPDATE mem_items SET hit_count=hit_count+1, last_hit=?, "
@@ -988,9 +1005,10 @@ def cmd_search(a):
     results, used, truncated, ids = select_flat(ranked, k, budget)
 
     now = int(time.time())
-    for i in ids:
-        con.execute("UPDATE mem_items SET hit_count=hit_count+1, last_hit=?, "
-                    "hot_score=MIN(1.0, hot_score+0.05), cold=0 WHERE id=?", (now, i))
+    if not getattr(a, "no_activate", False):
+        for i in ids:
+            con.execute("UPDATE mem_items SET hit_count=hit_count+1, last_hit=?, "
+                        "hot_score=MIN(1.0, hot_score+0.05), cold=0 WHERE id=?", (now, i))
     log_event(con, "search", None, a.actor, {"query": a.query, "hits": len(results)})
     con.commit()
     dt = time.time() - t0
@@ -1038,8 +1056,38 @@ def cmd_reinforce(a):
 
 
 def cmd_supersede(a):
+    import contextlib
     con = db(); init_db(con)
     now = int(time.time())
+    # 前台模式：只给旧 id + 新文本，一步完成"写入新条 + 标旧失效"
+    new_text = getattr(a, "new_text", None)
+    if new_text and (not getattr(a, "new", None) or getattr(a, "new", None) == "-"):
+        old_row = con.execute("SELECT * FROM mem_items WHERE id=?", (a.old,)).fetchone()
+        if not old_row:
+            print(json.dumps({"error": "not_found", "id": a.old}, ensure_ascii=False)); return
+        ns = argparse.Namespace(
+            content=new_text, scope=old_row["scope"],
+            claim_type=getattr(a, "claim_type", None) or old_row["claim_type"],
+            # 新陈述是“用户做的决定”，按 user 源写入（带 evidence）才会落 active，
+            # 用 self + 无端点会被降级成 draft，检索不到
+            origin="user", model="foreground", endpoint=getattr(a, "endpoint", ""),
+            evidence=getattr(a, "evidence", "") or "tool:supersede/%s" % a.old,
+            reproduce=None, force=True, quiet=True, actor=a.actor,
+            session=getattr(a, "session", None), turn=getattr(a, "turn", None),
+            allow_instruction=False, no_dedup=True, assertion=None,
+            tags=(old_row["tags"] or "") + ",supersede", entities="",
+            importance=old_row["importance"],
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_add(ns)
+        try:
+            a.new = (json.loads(buf.getvalue().strip()) or {}).get("id") or ""
+        except Exception:
+            a.new = ""
+        if not a.new:
+            print(json.dumps({"error": "add_failed", "raw": buf.getvalue()[:200]},
+                             ensure_ascii=False)); return
     old = con.execute("SELECT id FROM mem_items WHERE id=?", (a.old,)).fetchone()
     new = con.execute("SELECT id FROM mem_items WHERE id=?", (a.new,)).fetchone()
     if not old or not new:
@@ -1110,6 +1158,97 @@ def cmd_stats(a):
         "events": one("SELECT COUNT(*) FROM mem_events"),
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+# 调参界面用：范围与类型声明（与 config describe 的文案一致）
+CFG_RANGES = {
+    "decay.half_life_days": (7, 365, "float"),
+    "decay.cold_threshold": (0.05, 0.4, "float"),
+    "decay.revive_score": (0, 1, "float"),
+    "decay.self_factor": (0.3, 1.0, "float"),
+    "write.dedup_sim": (0.90, 0.99, "float"),
+    "write.max_content_chars": (200, 8000, "int"),
+    "search.default_k": (1, 20, "int"),
+    "search.max_tokens": (300, 8000, "int"),
+    "graph.related": (0.75, 0.95, "float"),
+    "graph.neardup": (0.90, 0.999, "float"),
+    "graph.contradicts": (0.85, 0.99, "float"),
+    "graph.hop_gamma": (0.5, 1.0, "float"),
+    "graph.top_k": (1, 20, "int"),
+    "graph.contra_k": (1, 20, "int"),
+    "graph.max_add": (0, 100, "int"),
+    "score.w_content": (0, 1, "float"),
+    "score.w_tags": (0, 1, "float"),
+    "score.w_keyword": (0, 1, "float"),
+    "score.w_graph": (0, 1, "float"),
+    "activation.boost": (0, 0.5, "float"),
+    "activation.half_life_min": (1, 1440, "int"),
+    "inject.stable_k": (3, 12, "int"),
+    "inject.dynamic_k": (1, 5, "int"),
+    "inject.tail_item_chars": (80, 300, "int"),
+    "segment.max_turns": (1, 200, "int"),
+    "segment.max_tokens": (1000, 200000, "int"),
+    "segment.drift_threshold": (0, 1, "float"),
+    "quota.max_writes_per_minute": (1, 600, "int"),
+    "quota.max_searches_per_minute": (1, 6000, "int"),
+    "quota.max_daily_writes": (1, 100000, "int"),
+}
+
+
+def _toml_quote(v):
+    s = str(v)
+    try:
+        float(s)
+        return s
+    except Exception:
+        pass
+    if s.lower() in ("true", "false"):
+        return s.lower()
+    return '"%s"' % s.replace('"', '\\"')
+
+
+def _toml_set(path, dotted, value):
+    """行级改写 mem.toml：保留注释与其它表，只动目标键"""
+    section, _, name = dotted.rpartition(".")
+    if not section:
+        section, name = "", dotted
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except FileNotFoundError:
+        lines = []
+    head = "[%s]" % section if section else None
+    start = None
+    for i, ln in enumerate(lines):
+        if head is None:
+            if ln.strip().startswith("["):
+                start = -1
+                break
+        elif ln.strip() == head:
+            start = i
+            break
+    if head and start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [head, "%s = %s" % (name, _toml_quote(value))]
+    else:
+        blk_end = len(lines)
+        for j in range((start or 0) + 1, len(lines)):
+            if lines[j].strip().startswith("["):
+                blk_end = j
+                break
+        hit = None
+        for j in range((start or 0) + 1, blk_end):
+            if lines[j].split("=")[0].strip() == name:
+                hit = j
+                break
+        if hit is None:
+            lines.insert(blk_end, "%s = %s" % (name, _toml_quote(value)))
+        else:
+            lines[hit] = "%s = %s" % (name, _toml_quote(value))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def cmd_config(a):
@@ -1191,6 +1330,51 @@ quota.max_daily_writes       默认 300
   ⚠️ 自报不可信：origin_model 不参与权限判定。
   ⚠️ 远程默认不可信：未登记的 http/https 端点一律按 draft 处理。
 """)
+        return
+    if a.action == "keys":
+        out = []
+        for k in sorted(DEFAULTS):
+            rng = CFG_RANGES.get(k)
+            out.append({
+                "key": k,
+                "value": cfg.get(k, ""),
+                "default": DEFAULTS[k],
+                "range": [rng[0], rng[1]] if rng else None,
+                "type": rng[2] if rng else "string",
+            })
+        print(json.dumps({"count": len(out), "keys": out}, ensure_ascii=False, indent=2))
+        return
+    if a.action == "set":
+        if not a.pairs:
+            print(json.dumps({"error": "need key=value"}, ensure_ascii=False)); return
+        changed, errors = {}, []
+        for pair in a.pairs:
+            if "=" not in pair:
+                errors.append("%s 不是 key=value" % pair); continue
+            k, v = pair.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k not in DEFAULTS:
+                errors.append("未知参数 %s（用 config keys 看全部）" % k); continue
+            rng = CFG_RANGES.get(k)
+            if rng:
+                try:
+                    fv = float(v)
+                except Exception:
+                    errors.append("%s 必须是数字" % k); continue
+                lo, hi, typ = rng
+                if not (lo <= fv <= hi):
+                    errors.append("%s=%s 超出范围 %s-%s" % (k, v, lo, hi)); continue
+                v = str(int(fv)) if typ == "int" else str(fv)
+            changed[k] = v
+        if errors:
+            print(json.dumps({"ok": False, "errors": errors}, ensure_ascii=False, indent=2)); return
+        for k, v in changed.items():
+            _toml_set(CFG_PATH, k, v)
+        # 写后回读校验：确认真的生效（不靠假设）
+        after = load_config()
+        bad = [k for k, v in changed.items() if str(after.get(k)) != str(v)]
+        print(json.dumps({"ok": not bad, "set": changed, "config": CFG_PATH,
+                          "not_effective": bad}, ensure_ascii=False, indent=2))
         return
     if a.action == "get":
         print(json.dumps({k: cfg[k] for k in sorted(cfg)}, ensure_ascii=False, indent=2))
@@ -1601,6 +1785,10 @@ SEGMENT_PROMPT = """你是会话记忆整理器。下面是一段编程会话的
 3. 去冗余   —— 同一个意思说三遍的，合并成一条
 4. 自足     —— 脱离上下文单独看，仍能看懂
 5. 保留原词 —— 专有名词、命令、路径、数字必须原样保留，不要意译
+6. 项目可辨 —— 判断这条是不是「项目级常识」：本项目专属的参数、阈值、路径、约定、技巧。
+   是，则在陈述里带上项目名（如 pi-package / ΠMem / 知识库）；
+   否（语言特性、算法原理、库的通用用法等通识），不要加项目名，加了反而污染跨项目检索。
+   判断标准：换个项目还成立吗？成立就不加。
 
 不要总结成"用户表示赞同"这种没有信息量的话。
 如果用户的话很短（如"去做""可以""赞同"），必须从上一轮助手的提议中
@@ -1673,33 +1861,58 @@ def _llm_chat(cfg, messages, max_tokens=3000):
 
 
 def _seg_source_text(con, seg, max_chars=24000):
-    """从转录里取出段的原文：按 entry id 区间截取"""
+    """从转录里取出段的原文。
+
+    切片优先按 turn 序号（turn = 第 N 条用户消息，见 scanSession），不依赖 entry id：
+      start = 第 turn_start 条用户消息
+      end   = 第 turn_end+1 条用户消息之前（**关键**：这样才包含最后一轮的助手回答）
+    只有 turn 信息缺失时才退回 id 区间，且同样向后延伸到下一条用户消息之前。
+    """
     path = seg["transcript"]
     if not path or not os.path.exists(path):
         return ""
     try:
-        lines = []
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    lines.append(json.loads(line))
+            entries = [json.loads(x) for x in f if x.strip()]
     except Exception:
         return ""
-    ids, started = [], False
-    for e in lines:
-        if e.get("id") == seg["first_id"]:
-            started = True
-        if started:
-            ids.append(e)
-        if started and e.get("id") == seg["last_id"]:
-            break
-    if not ids:
-        ids = lines
+
+    msgs = [e for e in entries if e.get("type") == "message"]
+    if not msgs:
+        return ""
+    users = [i for i, e in enumerate(msgs)
+             if ((e.get("message") or {}).get("role") == "user")]
+
+    def _bound():
+        ts = int(seg["turn_start"] or 0)
+        te = int(seg["turn_end"] or 0)
+        if ts >= 1 and te >= ts and te <= len(users):
+            start = users[ts - 1]
+            end = users[te] if te < len(users) else len(msgs)
+            return start, end
+        return None
+
+    def _bound_by_id():
+        want_first, want_last = seg["first_id"] or "", seg["last_id"] or ""
+        if not want_last:
+            return None
+        pos = {e.get("id"): i for i, e in enumerate(msgs) if e.get("id")}
+        li = pos.get(want_last)
+        fi = pos.get(want_first) if want_first else None
+        if li is None:
+            return None
+        if fi is None:                      # first_id 缺失/无效：从段开头最近的用户消息起
+            prev = [u for u in users if u <= li]
+            fi = prev[0] if prev else 0
+        nxt = [u for u in users if u > li]
+        end = nxt[0] if nxt else len(msgs)  # 向后吃到下一条用户消息之前
+        return fi, end
+
+    b = _bound() or _bound_by_id()
+    window = msgs[b[0]:b[1]] if b else msgs
+
     out = []
-    for e in ids:
-        if e.get("type") != "message":
-            continue
+    for e in window:
         m = e.get("message") or {}
         role = m.get("role")
         if role not in ("user", "assistant"):
@@ -1743,7 +1956,8 @@ def _seg_enrich_one(con, cfg, seg, dry=False):
         return {"id": seg["id"], "title": title, "digest": digest,
                 "statements": stmts, "chars": len(text)}
     # 向量用 title + digest + 所有陈述，检索面更大
-    vec = _seg_vec(title, digest + " " + " ".join(str(x.get("text")) for x in stmts))
+    vec = _seg_vec_for_index(title, digest,
+                             " ".join(str(x.get("text")) for x in stmts))
     con.execute("UPDATE mem_segments SET title=?,digest=?,statements=?,enriched=1,vector=?"
                 " WHERE id=?",
                 (title, digest, json.dumps(stmts, ensure_ascii=False), vec.tobytes(), seg["id"]))
@@ -1788,7 +2002,12 @@ def _promote_statements(con, seg, stmts, endpoint=""):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 cmd_add(ns)
-            out.append({"kind": kind, "text": text[:50]})
+            rid = ""
+            try:
+                rid = (json.loads(buf.getvalue().strip()) or {}).get("id") or ""
+            except Exception:
+                pass
+            out.append({"kind": kind, "text": text[:50], "id": rid})
         except Exception:
             pass
     return out
@@ -1811,33 +2030,78 @@ def _seg_state(con, sid):
     return con.execute("SELECT * FROM mem_segment_state WHERE session_id=?", (sid,)).fetchone()
 
 
-def _seg_open(con, sid, scope, text, turn, entry_id, vec, tok=0):
+def _seg_open(con, sid, scope, text, turn, entry_id, vec, tok=0, transcript=None):
     con.execute(
         "INSERT OR REPLACE INTO mem_segment_state(session_id,scope,seq,centroid,first_text,"
-        "last_text,first_id,last_id,turn_start,turn_last,n_turns,n_tok,opened_at)"
-        " VALUES(?,?,1,?,?,?,?,?,?,?,1,?,?)",
+        "last_text,first_id,last_id,turn_start,turn_last,n_turns,n_tok,transcript,opened_at)"
+        " VALUES(?,?,1,?,?,?,?,?,?,?,1,?,?,?)",
         (sid, scope, vec.tobytes(), text, text, entry_id or "", entry_id or "",
-         turn or 0, turn or 0, max(tok, n_tokens(text)), int(time.time())))
+         turn or 0, turn or 0, max(tok, n_tokens(text)), transcript or "",
+         int(time.time())))
     con.commit()
+
+
+def _seg_flat(s, n):
+    """折叠空白再截断：用户消息常带换行，标题/摘要要保持单行"""
+    import re as _re
+    return _re.sub(r"\s+", " ", (s or "")).strip()[:n]
+
+
+# 前台模式：陈述质量自检（本地正则，零 LLM）
+_FG_PRONOUN = re.compile(r"(这个|那个|它|该方案|此方案|上述|前者|后者|这样做|这种方式)")
+_FG_SUBJECT = re.compile(r"(用户|我们|助手|系统|模型|pi|mem)")
+FG_MAX_STMTS = 12
+FG_MAX_STMT_CHARS = 200
+
+
+def _check_statements(d, stmts):
+    """返回不合格原因列表；空列表 = 通过"""
+    errs = []
+    title = _seg_flat(d.get("title") or "", 999)
+    digest = _seg_flat(d.get("digest") or "", 999)
+    if not title:
+        errs.append("title 为空")
+    elif len(title) > SEG_TITLE_CHARS:
+        errs.append("title 超过 %d 字（现 %d）" % (SEG_TITLE_CHARS, len(title)))
+    if not digest:
+        errs.append("digest 为空")
+    elif len(digest) > SEG_DIGEST_CHARS:
+        errs.append("digest 超过 %d 字（现 %d）" % (SEG_DIGEST_CHARS, len(digest)))
+    if len(stmts) > FG_MAX_STMTS:
+        errs.append("statements 超过 %d 条（现 %d）" % (FG_MAX_STMTS, len(stmts)))
+    for i, s in enumerate(stmts, 1):
+        t = (s.get("text") or "").strip()
+        if len(t) < 8:
+            errs.append("#%d 太短（%d 字），去掉或改写" % (i, len(t)))
+        elif len(t) > FG_MAX_STMT_CHARS:
+            errs.append("#%d 超过 %d 字（现 %d）" % (i, FG_MAX_STMT_CHARS, len(t)))
+        if _FG_PRONOUN.search(t):
+            errs.append("#%d 含指代词（%s），必须替换成具体名词"
+                        % (i, _FG_PRONOUN.search(t).group(0)))
+        kind = str(s.get("kind") or "").lower()
+        if kind in ("decision", "preference", "constraint") and not _FG_SUBJECT.search(t):
+            errs.append("#%d 是 %s 但没写清主体（用户/系统/pi…）" % (i, kind))
+    return errs
 
 
 def _seg_close(con, st, scope, last_id, turn_last, reason):
     """把当前段落成一条 mem_segments，并和同域上一段建 continues 边"""
     first_text = st["first_text"] or ""
     last_text = st["last_text"] or ""
-    title = first_text[:SEG_TITLE_CHARS].strip() or "(未命名段)"
+    title = _seg_flat(first_text, SEG_TITLE_CHARS) or "(未命名段)"
     # 摘要用首尾两条用户消息：只取首条会丢掉后半段的话题
     if last_text and last_text != first_text:
-        digest = (first_text + " … " + last_text)[:SEG_DIGEST_CHARS]
+        digest = _seg_flat(first_text + " … " + last_text, SEG_DIGEST_CHARS)
     else:
-        digest = first_text[:SEG_DIGEST_CHARS]
+        digest = _seg_flat(first_text, SEG_DIGEST_CHARS)
     seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
     vec = _seg_vec(title, digest)
     con.execute(
         "INSERT INTO mem_segments(id,scope,session_id,seq,title,digest,transcript,"
         "first_id,last_id,turn_start,turn_end,n_tok,files,cmds,errors,vector,created_at)"
-        " VALUES(?,?,?,?,?,?,'',?,?,?,?,?,'[]','[]',0,?,?)",
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'[]','[]',0,?,?)",
         (seg_id, scope, st["session_id"], st["seq"], title, digest,
+         (st["transcript"] if "transcript" in st.keys() else "") or "",
          st["first_id"] or "", last_id or st["last_id"] or "",
          st["turn_start"] or 0, turn_last or st["turn_last"] or 0,
          st["n_tok"] or 0, vec.tobytes(), int(time.time())))
@@ -1855,15 +2119,20 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
             "reason": reason, "prev": prev["id"] if prev else None}
 
 
-def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0):
+def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0, transcript=None):
     """每轮调一次：更新段状态，必要时闭合旧段并开新段"""
     if not text or not sid:
         return None
     vec = embed(["query: " + text])[0]
     st = _seg_state(con, sid)
     if not st:
-        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens)
+        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens, transcript)
         return {"action": "open", "seq": 1, "drift": 1.0}
+    if transcript and (not ("transcript" in st.keys() and st["transcript"])):
+        con.execute("UPDATE mem_segment_state SET transcript=? WHERE session_id=?",
+                    (transcript, sid))
+        con.commit()
+        st = _seg_state(con, sid)
 
     centroid = np.frombuffer(st["centroid"], dtype=np.float32)
     sim = float(centroid @ vec)
@@ -1876,7 +2145,7 @@ def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0):
     if drift or capped:
         closed = _seg_close(con, st, scope, entry_id, turn,
                             "drift" if drift else "cap")
-        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens)
+        _seg_open(con, sid, scope, text, turn, entry_id, vec, turn_tokens, transcript)
         return {"action": "close", "closed": closed, "drift": round(sim, 3),
                 "new_seq": 1}
 
@@ -1896,6 +2165,19 @@ def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0):
 # ---------------- 会话段索引（C1：摘要 + 指针，不折叠） ----------------
 def _seg_vec(title, digest):
     return embed(["passage: " + (title or "") + "。" + (digest or "")])[0]
+
+
+def _seg_vec_for_index(title, digest, statements_text=""):
+    """入向量用的拼接：存储保留全文，进向量时收紧头部，把 256 token 窗口留给陈述。
+
+    实测：title 40 + digest 200 字 ≈ 194 token，只剩 62 token 给陈述；
+          title 20 + digest 100 字 ≈ 103 token，能留 153 token（1~2 条陈述）。
+    没有陈述时不做收紧——此时 title+digest 就是全部信息。
+    """
+    body = (statements_text or "").strip()
+    if body:
+        return _seg_vec((title or "")[:20], (digest or "")[:100] + " " + body)
+    return _seg_vec(title, digest)
 
 
 def cmd_segment(a):
@@ -1922,8 +2204,148 @@ def cmd_segment(a):
                          ensure_ascii=False))
         return
 
+    if sub == "commit":
+        """前台模式：模型给 title/digest/statements，一次完成 收口 + 摘要 + 提升 + 比对"""
+        import contextlib
+        cfg = load_config()
+        sid = a.session or ""
+        raw = a.payload or ""
+        if raw.startswith("@"):
+            with io.open(raw[1:], encoding="utf-8") as f:
+                raw = f.read()
+        try:
+            d = json.loads(raw or "{}")
+        except Exception as ex:
+            print(json.dumps({"ok": False, "errors": ["payload 不是合法 JSON: %s" % ex]},
+                             ensure_ascii=False)); return
+        stmts = [s for s in (d.get("statements") or [])
+                 if isinstance(s, dict) and str(s.get("text") or "").strip()]
+        errs = _check_statements(d, stmts)
+        if errs and not getattr(a, "force", False):
+            print(json.dumps({"ok": False, "errors": errs,
+                              "hint": "改正后重新调用；确实要跳过用 --force"},
+                             ensure_ascii=False, indent=2))
+            return
+        title = _seg_flat(d.get("title") or "", SEG_TITLE_CHARS) or "(未命名段)"
+        digest = _seg_flat(d.get("digest") or "", SEG_DIGEST_CHARS)
+        txt_all = " ".join(str(x.get("text")) for x in stmts)
+        st = _seg_state(con, sid) if sid else None
+        if st:
+            closed = _seg_close(con, st, a.scope or st["scope"],
+                                a.last_entry_id or st["last_id"],
+                                a.turn or st["turn_last"], "turn_commit")
+            seg_id = closed["id"]
+        else:
+            seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
+            con.execute(
+                "INSERT INTO mem_segments(id,scope,session_id,seq,title,digest,transcript,"
+                "first_id,last_id,turn_start,turn_end,n_tok,files,cmds,errors,vector,created_at)"
+                " VALUES(?,?,?,1,?,?,?,?,?,?,?,0,'[]','[]',0,?,?)",
+                (seg_id, a.scope or "global", sid, title, digest, a.transcript or "",
+                 a.last_entry_id or "", a.last_entry_id or "",
+                 a.turn or 0, a.turn or 0, _seg_vec(title, digest).tobytes(), int(time.time())))
+            con.commit()
+        con.execute("UPDATE mem_segments SET title=?,digest=?,statements=?,enriched=1,vector=?"
+                    " WHERE id=?",
+                    (title, digest, json.dumps(stmts, ensure_ascii=False),
+                     _seg_vec_for_index(title, digest, txt_all).tobytes(), seg_id))
+        con.commit()
+        seg_row = con.execute("SELECT * FROM mem_segments WHERE id=?", (seg_id,)).fetchone()
+        promoted = _promote_statements(con, seg_row, stmts, cfg.get("llm.endpoint") or "")
+
+        # 逻辑比对：对每条提升的决策，找同域最近旧条目，标出可能被推翻的
+        conflicts = []
+        for p in promoted:
+            if not p.get("id"):
+                continue
+            try:
+                ranked = _search_core(con, cfg, p["text"], seg_row["scope"], 5)
+            except Exception:
+                continue
+            for sc, _, r2 in ranked:
+                if r2["id"] == p["id"] or sc < 0.45:
+                    continue
+                why = []
+                if numeric_conflict(r2["content"], p["text"]):
+                    why.append("number")
+                if looks_contradictory(r2["content"], p["text"]):
+                    why.append("negation")
+                if not why:
+                    continue
+                conflicts.append({"old": r2["id"], "new": p["id"],
+                                  "score": round(sc, 3), "why": why,
+                                  "old_text": (r2["content"] or "")[:80]})
+
+        # payload 自带推翻：[{"old_id": "mem-...", "text": "完整新陈述"}]
+        superseded = []
+        for sp in (d.get("supersedes") or []):
+            oid, ntext = sp.get("old_id"), sp.get("text")
+            if not oid or not ntext:
+                continue
+            ns = argparse.Namespace(old=oid, new="-", new_text=ntext, session=sid,
+                                    actor="foreground", quiet=True, endpoint="",
+                                    evidence="", claim_type=None, turn=None)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_supersede(ns)
+            try:
+                superseded.append(json.loads(buf.getvalue().strip() or "{}"))
+            except Exception:
+                superseded.append({"old": oid, "error": "bad_output"})
+
+        print(json.dumps({"ok": True,
+                          "segment": {"id": seg_id, "title": title,
+                                      "digest": digest, "statements": len(stmts)},
+                          "errors": errs, "promoted": promoted,
+                          "conflicts": conflicts[:5], "superseded": superseded},
+                         ensure_ascii=False, indent=2))
+        return
+
+    if sub == "brief":
+        """给压缩后注入用的段指针块（一次性的、不进 system）。
+
+        格式刻意压短：id｜标题｜轮次｜摘要前 N 字。不加时间戳/随机数，
+        同内容逐字节一致，便于转发时不抖动。
+        """
+        n = int(a.limit or 5)
+        chars = int(getattr(a, "chars", 40) or 40)
+        def _rows(only_enriched):
+            sql = ("SELECT id,scope,title,digest,turn_start,turn_end,enriched "
+                   "FROM mem_segments WHERE 1=1")
+            params = []
+            if only_enriched:
+                sql += " AND enriched=1"
+            if a.scope and a.scope != "global":
+                sql += " AND scope IN (?, 'global')"
+                params.append(a.scope)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(n)
+            return con.execute(sql, params).fetchall()
+
+        # 默认只要模型写过摘要的段：L1 兜底段的标题是原始用户文本，又长又吵
+        rows = [] if getattr(a, "all_segments", False) else _rows(True)
+        if not rows:
+            rows = _rows(False)
+        if not rows:
+            print(json.dumps({"text": "", "ids": [], "count": 0}, ensure_ascii=False))
+            return
+        lines = ["[mem:seg-index] 压缩前归档的 %d 段（原文用 segment get <id> --part）" % len(rows)]
+        ids = []
+        for r in rows:
+            d = _seg_flat(r["digest"] or "", chars)
+            ts, te = r["turn_start"] or 0, r["turn_end"] or 0
+            turns = ("第 %s–%s 轮" % (ts, te)) if (ts and te and te >= ts) else                     ("第 %s 轮" % ts if ts else "")
+            lines.append("%s｜%s｜%s｜%s" % (
+                r["id"], _seg_flat(r["title"] or "", 20), turns, d))
+            ids.append(r["id"])
+        text = chr(10).join(lines)
+        print(json.dumps({"text": text, "ids": ids, "count": len(rows),
+                          "chars": len(text)}, ensure_ascii=False, indent=2 if a.pretty else None))
+        return
+
     if sub == "list":
-        q = "SELECT id,scope,session_id,seq,title,n_tok,turn_start,turn_end,created_at FROM mem_segments"
+        q = ("SELECT id,scope,session_id,seq,title,n_tok,turn_start,turn_end,enriched,"
+             "transcript<>'' AS has_src,created_at FROM mem_segments")
         params = []
         if a.scope:
             q += " WHERE scope=?"
@@ -1942,12 +2364,7 @@ def cmd_segment(a):
         text = ""
         if a.part and d.get("transcript"):
             try:
-                import io as _io
-                with _io.open(d["transcript"], encoding="utf-8") as f:
-                    lines = [json.loads(x) for x in f if x.strip()]
-                ids = {d.get("first_id"), d.get("last_id")}
-                text = "\n".join(json.dumps(x, ensure_ascii=False) for x in lines
-                                 if x.get("id") in ids)
+                text = _seg_source_text(con, r)
             except Exception as e:
                 text = "读取失败: %s" % e
         print(json.dumps({"segment": d, "text": text}, ensure_ascii=False, indent=2))
@@ -1960,7 +2377,19 @@ def cmd_segment(a):
         st = _seg_state(con, sid)
         closed = None
         if st:
+            # 关窗时宿主能给出会话文件路径；老的开段记录没有，这里补上
+            tp = getattr(a, "transcript", None)
+            if tp and not (("transcript" in st.keys() and st["transcript"]) or ""):
+                con.execute("UPDATE mem_segment_state SET transcript=? WHERE session_id=?",
+                            (tp, sid))
+                con.commit()
+                st = _seg_state(con, sid)
             closed = _seg_close(con, st, st["scope"], st["last_id"], st["turn_last"], "session_end")
+        if getattr(a, "no_enrich", False):
+            print(json.dumps({"ok": True, "closed": closed, "enriched": 0,
+                              "note": "--no-enrich：只收口，不调 LLM"},
+                             ensure_ascii=False, indent=2))
+            return
         segs = con.execute("SELECT * FROM mem_segments WHERE session_id=? AND enriched=0"
                            " ORDER BY created_at LIMIT ?", (sid, int(a.limit or 20))).fetchall()
         out = []
@@ -2353,7 +2782,7 @@ def cmd_serve(a):
 
     仅监听 127.0.0.1。接口：
       GET  /health
-      POST /retrieve {session,query,scope,exclude_ids,candidates,turn,entry_id,turn_tokens}
+      POST /retrieve {session,query,scope,exclude_ids,candidates,turn,entry_id,turn_tokens,transcript}
       POST /search   {query,scope,k,include_cold,include_drafts}
       POST /add      {content,scope,origin,claim_type,endpoint,evidence,tags}
       POST /snapshot {session,query,scope}
@@ -2392,6 +2821,7 @@ def cmd_serve(a):
                         scope=b.get("scope"), candidates=int(b.get("candidates", 30)),
                         turn=b.get("turn"), entry_id=b.get("entry_id"),
                         turn_tokens=int(b.get("turn_tokens", 0) or 0),
+                        transcript=b.get("transcript"),
                         exclude_ids=",".join(b.get("exclude_ids") or []))
         if path == "/search":
             return call(cmd_search, query=b.get("query", ""), scope=b.get("scope"),
@@ -2690,7 +3120,8 @@ def cmd_retrieve(a):
     try:
         seg_info = track_segment(con, sid, scope, query,
                                  getattr(a, "turn", None), getattr(a, "entry_id", None),
-                                 getattr(a, "turn_tokens", 0) or 0)
+                                 getattr(a, "turn_tokens", 0) or 0,
+                                 getattr(a, "transcript", None))
     except Exception:
         pass
 
@@ -2790,6 +3221,56 @@ def cmd_retrieve(a):
     }, ensure_ascii=False, indent=2 if a.pretty else None))
 
 
+# ==================== 宿主无关的锚点接口（S4） ====================
+ANCHOR_CONTRACT = 1
+
+
+def cmd_hook(a):
+    """锚点入口：所有 agent 每轮调这一个。返回稳定的 v1 信封。
+
+    约定：
+      调用方只需提供 session / query / scope / turn / entry-id（可选 transcript）。
+      返回 system（永不变化，可缓存）+ tail（每轮变化，追加到本轮消息末尾）。
+      lanes 字段告诉宿主每条通道的状态，失败时只降级该通道。
+    """
+    import contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cmd_retrieve(a)
+        d = json.loads(buf.getvalue().strip() or "{}")
+    except Exception as e:
+        print(json.dumps({"v": ANCHOR_CONTRACT, "hook": "anchor", "system": "", "tail": "",
+                          "lanes": {"error": str(e)[:200]}}, ensure_ascii=False))
+        return
+    stable = d.get("stable") or {}
+    tail = d.get("tail") or {}
+    seg = d.get("segment") or None
+    domains = d.get("domains") or []
+    out = {
+        "v": ANCHOR_CONTRACT,
+        "hook": "anchor",
+        "system": stable.get("text") or "",
+        "tail": tail.get("text") or "",
+        "stable_hash": stable.get("hash") or "",
+        "ids": {"stable": stable.get("ids") or [], "tail": tail.get("ids") or []},
+        "domains": domains,
+        "segment": seg,
+        "insert": d.get("insert") or {"system": "append", "afterUserText": "\n\n"},
+        "lanes": {
+            # 串行执行（不并行：避免并发 debug 成本）
+            #   A: persistent + working —— 同一次 retrieve 内完成，共用嵌入器
+            #   B: kb      —— 默认 off，MEM_KB=1 才接（知识库独立仓 / LanceDB）
+            #   C: focus   —— 默认 off，MEM_FOCUS=1 才接（注意力，独立 focus.db）
+            "persistent": "ok" if (stable.get("ids") or []) else "empty",
+            "working": "ok" if seg else "empty",
+            "kb": "off",
+            "focus": "off",
+        },
+        "debug": d.get("debug") or {},
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2 if getattr(a, "pretty", False) else None))
+
 def cmd_snapshot(a):
     """压缩前取 top-5，交给压缩请求"""
     cfg = load_config()
@@ -2850,6 +3331,8 @@ def main():
     s.add_argument("--include-cold", action="store_true")
     s.add_argument("--include-drafts", action="store_true")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--no-activate", dest="no_activate", action="store_true",
+                   help="不写 last_hit/hit_count（测试、调参、评测用，避免自测污染排序）")
     s.add_argument("--json", action="store_true", default=True)
     s.add_argument("--pretty", action="store_true")
     s.set_defaults(func=cmd_search)
@@ -2861,7 +3344,12 @@ def main():
     s = sub.add_parser("reinforce", parents=[common]); s.add_argument("id"); s.set_defaults(func=cmd_reinforce)
 
     s = sub.add_parser("supersede", parents=[common])
-    s.add_argument("old"); s.add_argument("new")
+    s.add_argument("old"); s.add_argument("new", nargs="?", default="-")
+    s.add_argument("--new-text", dest="new_text", default=None,
+                   help="直接给新陈述：自动写入新条再标旧条失效")
+    s.add_argument("--session", default=None)
+    s.add_argument("--evidence", default="")
+    s.add_argument("--claim-type", dest="claim_type", default=None)
     s.set_defaults(func=cmd_supersede)
 
     s = sub.add_parser("forget", parents=[common])
@@ -2896,7 +3384,23 @@ def main():
     s.add_argument("--entry-id", dest="entry_id", default=None, help="当前 user 条目 id（段指针）")
     s.add_argument("--turn-tokens", dest="turn_tokens", type=int, default=0,
                    help="本轮消耗的 token 估算（段硬上限用）")
+    s.add_argument("--transcript", default=None,
+                   help="会话原文 JSONL 路径（段指针用，闭合时写入 mem_segments）")
     s.set_defaults(func=cmd_retrieve)
+
+    s = sub.add_parser("hook", parents=[common])
+    s.add_argument("--session", required=True)
+    s.add_argument("--query", required=True)
+    s.add_argument("--scope", default=None)
+    s.add_argument("--candidates", type=int, default=30)
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--pretty", action="store_true")
+    s.add_argument("--exclude-ids", default="")
+    s.add_argument("--turn", type=int, default=None)
+    s.add_argument("--entry-id", dest="entry_id", default=None)
+    s.add_argument("--turn-tokens", dest="turn_tokens", type=int, default=0)
+    s.add_argument("--transcript", default=None)
+    s.set_defaults(func=cmd_hook)
 
     s = sub.add_parser("snapshot", parents=[common])
     s.add_argument("--session", required=True)
@@ -2923,7 +3427,8 @@ def main():
     sga.add_argument("--cmds", default="[]")
     sga.add_argument("--errors", type=int, default=0)
     sgl = sgs.add_parser("list"); sgl.add_argument("--scope", default=None); sgl.add_argument("--limit", type=int, default=30)
-    sgg = sgs.add_parser("get"); sgg.add_argument("id"); sgg.add_argument("--part", default=None)
+    sgg = sgs.add_parser("get"); sgg.add_argument("id"); sgg.add_argument("--part", action="store_true",
+                                                          help="同时读回 first_id~last_id 区间原文")
     sgc = sgs.add_parser("activate"); sgc.add_argument("--query", required=True)
     sgc.add_argument("-k", "--k", type=int, default=3)
     sgc.add_argument("--scope", default=None, help="只看该工作区（含 global）")
@@ -2932,10 +3437,29 @@ def main():
     sge.add_argument("--session", default=None)
     sge.add_argument("--limit", type=int, default=10)
     sge.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgc2 = sgs.add_parser("commit")
+    sgc2.add_argument("--session", default=None)
+    sgc2.add_argument("--payload", required=True, help="JSON 或 @文件路径")
+    sgc2.add_argument("--scope", default=None)
+    sgc2.add_argument("--turn", type=int, default=None)
+    sgc2.add_argument("--last-entry-id", dest="last_entry_id", default=None)
+    sgc2.add_argument("--transcript", default=None)
+    sgc2.add_argument("--force", action="store_true", help="跳过陈述自检")
     sgf = sgs.add_parser("finalize")
     sgf.add_argument("--session", required=True)
+    sgf.add_argument("--transcript", default=None,
+                     help="会话原文 JSONL 路径（补写进当前开段）")
     sgf.add_argument("--limit", type=int, default=20)
+    sgf.add_argument("--no-enrich", dest="no_enrich", action="store_true",
+                     help="只本地收口，不调 LLM（前台模式的关窗路径）")
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgb = sgs.add_parser("brief")
+    sgb.add_argument("--scope", default=None)
+    sgb.add_argument("--limit", type=int, default=5)
+    sgb.add_argument("--chars", type=int, default=40)
+    sgb.add_argument("--all", dest="all_segments", action="store_true",
+                     help="包含没有 L2 摘要的 L1 兜底段（标题是原始用户文本，通常更长更吵）")
+    sgb.add_argument("--pretty", action="store_true")
     sg.set_defaults(func=cmd_segment)
 
     s = sub.add_parser("ingest", parents=[common])
@@ -2995,7 +3519,8 @@ def main():
     s.set_defaults(func=cmd_consolidate)
 
     s = sub.add_parser("config", parents=[common])
-    s.add_argument("action", choices=["describe", "get", "path"])
+    s.add_argument("action", choices=["describe", "get", "keys", "set", "path"])
+    s.add_argument("pairs", nargs="*", help="set 用：key=value key2=value2")
     s.set_defaults(func=cmd_config)
 
     a = ap.parse_args()
