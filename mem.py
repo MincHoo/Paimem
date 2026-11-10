@@ -3801,16 +3801,25 @@ def cmd_retrieve(a):
             domains = _activate_domains(con, query, scope, k=3, sid=sid,
                                         w_sem=fcfg(cfg, "segment.w_sem"),
                                         w_kw=fcfg(cfg, "segment.w_kw"))
-        except Exception:
+        except Exception as e:
+            # 静默兜底很危险：双 WHERE 那次 domains 一直被吞成空，日志里毫无痕迹
             domains = []
+            try:
+                log_event(con, "domains_error", None, "hook", {"err": str(e)[:200]})
+            except Exception:
+                pass
         try:
             handoff = _last_session_handoff(con, scope, sid)
             # 域激活已经点到那个会话就不重复报一次（省 token，也避免两条块打架）
             seen_sessions = {d.get("session") for d in domains if not d.get("own")}
             if handoff and handoff[0]["session"] in seen_sessions:
                 handoff = []
-        except Exception:
+        except Exception as e:
             handoff = []
+            try:
+                log_event(con, "handoff_error", None, "hook", {"err": str(e)[:200]})
+            except Exception:
+                pass
 
     t0 = time.time()
     ranked = _search_core(con, cfg, query, items_scope, a.candidates)
