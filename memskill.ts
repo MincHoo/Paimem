@@ -29,7 +29,7 @@ import { promisify } from "node:util";
 import { appendFile, mkdir } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
@@ -153,7 +153,14 @@ async function health(ms = 600): Promise<boolean> {
 	if (!USE_DAEMON) return false;
 	try {
 		const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(ms) });
-		return r.ok;
+		if (!r.ok) return false;
+		// 端口可能被另一个 MEM_HOME 的 daemon 占着：库不对就别用
+		const j = (await r.json().catch(() => null)) as { home?: string } | null;
+		if (j?.home && resolve(j.home) !== resolve(MEM_HOME)) {
+			await log({ t: Date.now(), event: "daemon_home_mismatch", mine: MEM_HOME, theirs: j.home });
+			return false;
+		}
+		return true;
 	} catch {
 		return false;
 	}

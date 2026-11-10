@@ -2854,7 +2854,8 @@ def cmd_serve(a):
         if path == "/health":
             con = db(); init_db(con)
             n = con.execute("SELECT COUNT(*) FROM mem_items WHERE status='active'").fetchone()[0]
-            return {"ok": True, "active": n, "pid": os.getpid()}
+            return {"ok": True, "active": n, "pid": os.getpid(),
+                    "home": os.path.abspath(BASE)}
         if path == "/retrieve":
             return call(cmd_retrieve, session=b.get("session", ""), query=b.get("query", ""),
                         scope=b.get("scope"), candidates=int(b.get("candidates", 30)),
@@ -3549,7 +3550,7 @@ def main():
 
     s = sub.add_parser("serve", parents=[common])
     s.add_argument("--port", type=int, default=7788)
-    s.add_argument("--idle-timeout", dest="idle_timeout", type=int, default=3600,
+    s.add_argument("--idle-timeout", dest="idle_timeout", type=int, default=900,
                    help="空闲多少秒后自动退出（0=不退出）")
     s.set_defaults(func=cmd_serve)
 
