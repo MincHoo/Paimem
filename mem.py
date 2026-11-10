@@ -2100,6 +2100,9 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
     else:
         digest = _seg_flat(first_text, SEG_DIGEST_CHARS)
     seg_id = "seg-" + time.strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6]
+    # 压缩后宿主的轮次计数会回退（实测 23→2），落库前夹紧，别写出倒挂数据
+    t_start = int(st["turn_start"] or 0)
+    t_end = max(int(turn_last or 0), int(st["turn_last"] or 0), t_start)
     vec = _seg_vec(title, digest)
     con.execute(
         "INSERT INTO mem_segments(id,scope,session_id,seq,title,digest,transcript,"
@@ -2108,7 +2111,7 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
         (seg_id, scope, st["session_id"], st["seq"], title, digest,
          (st["transcript"] if "transcript" in st.keys() else "") or "",
          st["first_id"] or "", last_id or st["last_id"] or "",
-         st["turn_start"] or 0, turn_last or st["turn_last"] or 0,
+         t_start, t_end,
          st["n_tok"] or 0, vec.tobytes(), int(time.time())))
     # 会话链：同域里最近的一条段 → 本段
     prev = con.execute(
@@ -2122,7 +2125,7 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
     total = con.execute("SELECT COUNT(*) c FROM mem_segments WHERE session_id=?",
                         (st["session_id"],)).fetchone()["c"]
     return {"id": seg_id, "title": title, "digest": digest,
-            "turns": [st["turn_start"], turn_last], "n_tok": st["n_tok"],
+            "turns": [t_start, t_end], "n_tok": st["n_tok"],
             "reason": reason, "prev": prev["id"] if prev else None,
             "session_seq": st["seq"], "session_total": total}
 
@@ -2187,6 +2190,71 @@ def _seg_vec_for_index(title, digest, statements_text=""):
         return _seg_vec((title or "")[:20], (digest or "")[:100] + " " + body)
     return _seg_vec(title, digest)
 
+
+
+def _anchor_turn(path, anchor):
+    """把消息 id 映射回"第几轮用户消息"（1 基）。找不到返回 0。"""
+    if not path or not anchor or not os.path.exists(path):
+        return 0
+    n = 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                msg = e.get("message") or {}
+                if msg.get("role") == "user":
+                    n += 1
+                if anchor in (e.get("id"), msg.get("id")):
+                    return n
+    except Exception:
+        return 0
+    return 0
+
+
+def cmd_segment_repair_turns(a):
+    """修复 turn_start/turn_end 倒挂：用段自带的 first_id/last_id 回会话原文重新定位。"""
+    con = db(); init_db(con)
+    rows = con.execute(
+        "SELECT id,title,transcript,first_id,last_id,turn_start,turn_end FROM mem_segments"
+        " ORDER BY created_at").fetchall()
+    fixed, unresolved = [], []
+    for r in rows:
+        ts, te = int(r["turn_start"] or 0), int(r["turn_end"] or 0)
+        if ts > 0 and te >= ts:
+            continue
+        n_ts = _anchor_turn(r["transcript"], r["first_id"])
+        n_te = _anchor_turn(r["transcript"], r["last_id"])
+        new_ts = n_ts or ts
+        new_te = max(n_te, new_ts)
+        if new_ts <= 0 or new_te < new_ts:
+            unresolved.append((r["id"], ts, te))
+            continue
+        fixed.append((r["id"], ts, te, new_ts, new_te, (r["title"] or "")[:24]))
+    for sid, ts, te, nts, nte, ttl in fixed:
+        print("  %s  %s→%s  修为 %s→%s  「%s」" % (sid, ts, te, nts, nte, ttl))
+    for sid, ts, te in unresolved:
+        print("  %s  %s→%s  无法定位（原文缺失/锚点丢失），跳过" % (sid, ts, te))
+    if not fixed:
+        print("没有可修的段（倒挂 %d 条，其中可修 0 条）" % len(unresolved))
+        return 0
+    if not getattr(a, "apply", False):
+        print("\n以上为预演（加 --apply 才写库）")
+        return 0
+    for sid, ts, te, nts, nte, _ in fixed:
+        con.execute("UPDATE mem_segments SET turn_start=?,turn_end=? WHERE id=?",
+                    (nts, nte, sid))
+        con.execute("INSERT INTO mem_events(ts,action,item_id,actor,detail) VALUES(?,?,?,?,?)",
+                    (int(time.time()), "repair_turns", sid, "cli",
+                     json.dumps({"from": [ts, te], "to": [nts, nte]}, ensure_ascii=False)))
+    con.commit()
+    print("\n已修 %d 条" % len(fixed))
+    return 0
 
 def cmd_segment(a):
     con = db(); init_db(con)
@@ -2321,6 +2389,9 @@ def cmd_segment(a):
                           "conflicts": conflicts[:5], "superseded": superseded},
                          ensure_ascii=False, indent=2))
         return
+
+    if sub == "repair-turns":
+        return cmd_segment_repair_turns(a)
 
     if sub == "brief":
         """给压缩后注入用的段指针块（一次性的、不进 system）。
@@ -3509,6 +3580,9 @@ def main():
     sgf.add_argument("--no-enrich", dest="no_enrich", action="store_true",
                      help="只本地收口，不调 LLM（前台模式的关窗路径）")
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgr = sgs.add_parser("repair-turns")
+    sgr.add_argument("--apply", action="store_true", help="真的写库（默认只预演）")
+    sgr.set_defaults(segment_cmd="repair-turns")
     sgb = sgs.add_parser("brief")
     sgb.add_argument("--scope", default=None)
     sgb.add_argument("--session", default=None, help="标注哪些段属于本会话")
