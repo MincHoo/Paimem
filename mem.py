@@ -3723,6 +3723,13 @@ def cmd_retrieve(a):
     sid = a.session
     row = get_session(con, sid)
     scope = a.scope or (row["scope"] if row else "")
+    # 回退检索只是"本项目没记忆，换 global 再看看这批 items"，
+    # 不能改写会话 scope，也不能让 handoff 跟着换成 global
+    # （否则会给模型报一个无关的旧段当"上次收尾"，实测就报成了 14.8 小时前的 global 段）
+    items_only = bool(getattr(a, "items_only", False))
+    items_scope = scope
+    if items_only:
+        scope = (row["scope"] if row and row["scope"] else "")
 
     # 段跟踪（话题漂移检测），结果随 retrieve 一起返回，不额外往返
     seg_info = None
@@ -3737,7 +3744,7 @@ def cmd_retrieve(a):
     # 第一轮顺带做域激活：拿当前 query 找相关历史段，返回给宿主注入
     domains = []
     handoff = []
-    if (getattr(a, "turn", None) or 0) <= 1 and query:
+    if not items_only and (getattr(a, "turn", None) or 0) <= 1 and query:
         try:
             domains = _activate_domains(con, query, scope, k=3, sid=sid,
                                         w_sem=fcfg(cfg, "segment.w_sem"),
@@ -3754,7 +3761,7 @@ def cmd_retrieve(a):
             handoff = []
 
     t0 = time.time()
-    ranked = _search_core(con, cfg, query, scope, a.candidates)
+    ranked = _search_core(con, cfg, query, items_scope, a.candidates)
     if not ranked:
         con.commit()
         print(json.dumps({"v": 1, "stable": {"text": "", "hash": "", "ids": []},
@@ -3810,13 +3817,14 @@ def cmd_retrieve(a):
         tail_text = anchor_text + ((chr(10) + chr(10) + tail_text) if tail_text else "")
 
     # 重锚块是一次性的：本轮返回后清空（已进入对话历史，不必重复）
-    save_session(con, sid, scope=scope, stable_text=stable_text, stable_hash=stable_hash,
+    if not items_only:      # 回退探测不落会话状态（scope 以真实那次为准）
+        save_session(con, sid, scope=scope, stable_text=stable_text, stable_hash=stable_hash,
                  stable_ids=",".join(stable_ids), anchor_text="",
                  anchor_ids="", drift=drift, reanchors=reanchors,
                  last_query=query)
 
     now = int(time.time())
-    for i in set(stable_ids) | set(tail_ids):
+    for i in (set() if items_only else (set(stable_ids) | set(tail_ids))):
         con.execute("UPDATE mem_items SET hit_count=hit_count+1, last_hit=? WHERE id=?", (now, i))
     log_event(con, "retrieve", None, a.actor, {"session": sid, "n_stable": len(stable_ids),
                                                "n_tail": len(tail_ids), "drift": drift})
@@ -4018,6 +4026,8 @@ def main():
                    help="本轮消耗的 token 估算（段硬上限用）")
     s.add_argument("--transcript", default=None,
                    help="会话原文 JSONL 路径（段指针用，闭合时写入 mem_segments）")
+    s.add_argument("--items-only", dest="items_only", action="store_true",
+                   help="只做 items 检索（回退 scope 用）：不写会话 scope、不做首轮域激活/handoff")
     s.set_defaults(func=cmd_retrieve)
 
     s = sub.add_parser("hook", parents=[common])

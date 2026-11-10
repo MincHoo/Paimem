@@ -572,7 +572,9 @@ export default function (pi: ExtensionAPI) {
 		let usedScope = scope;
 		const fbTried = (out.debug?.candidates ?? 0) === 0 && !!FALLBACK_SCOPE && FALLBACK_SCOPE !== scope;
 		if (fbTried) {
-			const fb = (await runMem(args(FALLBACK_SCOPE), "/retrieve", {
+			// 只回退 items：--items-only 让 mem.py 不写会话 scope、不做首轮域激活/handoff，
+			// 否则 handoff 会跟着换到 global，报一个无关的旧段当"上次收尾"
+			const fb = (await runMem([...args(FALLBACK_SCOPE), "--items-only"], "/retrieve", {
 				session: sid,
 				query,
 				scope: FALLBACK_SCOPE,
