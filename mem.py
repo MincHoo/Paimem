@@ -35,6 +35,7 @@ import numpy as np
 # ---------------- 路径与配置 ----------------
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("MEM_HOME", os.path.join(os.path.expanduser("~"), ".mem"))
+HOME_PATH = BASE  # cmd_serve 内 BASE 会被 Namespace 遮蔽，路径判断一律用这个
 DB_PATH = os.environ.get("MEM_DB", os.path.join(BASE, "mem.db"))
 CFG_PATH = os.environ.get("MEM_CONFIG", os.path.join(BASE, "mem.toml"))
 TRUST_PATH = os.environ.get("MEM_TRUST", os.path.join(BASE, "trust.toml"))
@@ -2832,6 +2833,7 @@ def cmd_serve(a):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     LAST_REQ = [time.time()]
+    START_TS = time.time()
 
     BASE = dict(quiet=True, actor="daemon", pretty=False, force=True, json=True,
                 scope=None, candidates=30, k=0, max_tokens=0,
@@ -2855,7 +2857,15 @@ def cmd_serve(a):
             con = db(); init_db(con)
             n = con.execute("SELECT COUNT(*) FROM mem_items WHERE status='active'").fetchone()[0]
             return {"ok": True, "active": n, "pid": os.getpid(),
-                    "home": os.path.abspath(BASE)}
+                    "home": os.path.abspath(HOME_PATH),
+                    # 宿主据此判断常驻进程里的代码是不是比磁盘上的旧
+                    "py_mtime": int(os.path.getmtime(os.path.abspath(__file__))),
+                    "started": int(START_TS)}
+        if path == "/shutdown":
+            # 代码换了以后，宿主让旧常驻进程自己退，下一轮自然起新的
+            threading.Timer(0.2, lambda: os._exit(0)).start()
+            return {"ok": True, "pid": os.getpid()}
+
         if path == "/retrieve":
             return call(cmd_retrieve, session=b.get("session", ""), query=b.get("query", ""),
                         scope=b.get("scope"), candidates=int(b.get("candidates", 30)),

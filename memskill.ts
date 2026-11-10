@@ -27,7 +27,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { appendFile, mkdir } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -149,16 +149,46 @@ let daemonReady: Promise<boolean> | null = null;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+let staleDaemon = false;
 async function health(ms = 600): Promise<boolean> {
 	if (!USE_DAEMON) return false;
 	try {
 		const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(ms) });
 		if (!r.ok) return false;
 		// 端口可能被另一个 MEM_HOME 的 daemon 占着：库不对就别用
-		const j = (await r.json().catch(() => null)) as { home?: string } | null;
+		const j = (await r.json().catch(() => null)) as
+			| { home?: string; py_mtime?: number; pid?: number }
+			| null;
 		if (j?.home && resolve(j.home) !== resolve(MEM_HOME)) {
 			await log({ t: Date.now(), event: "daemon_home_mismatch", mine: MEM_HOME, theirs: j.home });
 			return false;
+		}
+		// 常驻进程里跑的是旧代码（改过 mem.py 但没重启）→ 让它自己退，本轮退回起进程
+		try {
+			const mine = Math.floor(statSync(MEM_PY).mtimeMs / 1000);
+			// 没有 py_mtime 字段 = 比本适配器更旧的常驻进程，一律换掉
+			if (j && (!j.py_mtime || mine > j.py_mtime + 1)) {
+				await log({ t: Date.now(), event: "daemon_stale", mine, theirs: j.py_mtime, pid: j.pid });
+				const sd = await fetch(`${BASE}/shutdown`, {
+					method: "POST", signal: AbortSignal.timeout(800),
+				}).catch(() => null);
+				// 老版本没有 /shutdown 路由（返回 200 + ok:false）：直接按 pid 收掉
+				let byeOk = false;
+				try { byeOk = Boolean((await sd?.json())?.ok); } catch { /* ignore */ }
+				if (!byeOk) {
+					try { if (j.pid) process.kill(j.pid); } catch { /* 已退出 */ }
+				}
+				for (let i = 0; i < 12; i++) {           // 最多等 2.4 秒退干净
+					await sleep(200);
+					const alive = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(300) })
+						.then((x) => x.ok).catch(() => false);
+					staleDaemon = alive;
+					if (!alive) break;
+				}
+				return false;
+			}
+		} catch {
+			/* ignore */
 		}
 		return true;
 	} catch {
@@ -170,6 +200,11 @@ async function ensureDaemon(): Promise<boolean> {
 	if (!USE_DAEMON) return false;
 	if (daemon && daemon.exitCode === null && (await health(300))) return true;
 	if (await health(300)) return true; // 别的 pi 实例已经拉起
+	// 端口上还是个旧代码进程且收不掉 → 别在这里空转 20 秒，直接退回起进程
+	if (staleDaemon) {
+		await log({ t: Date.now(), event: "daemon_stuck_stale", port: PORT });
+		return false;
+	}
 	try {
 		const py = await resolvePython();
 		if (!py) {
