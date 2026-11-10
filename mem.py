@@ -34,15 +34,43 @@ import numpy as np
 
 # ---------------- 路径与配置 ----------------
 HOME = os.path.expanduser("~")
-BASE = os.environ.get("MEM_HOME", os.path.join(os.path.expanduser("~"), ".mem"))
+
+
+def _boot_cfg_path():
+    """引导配置的位置必须固定：库要搬到哪去，得先读到 mem.toml 才知道"""
+    return os.environ.get("MEM_CONFIG", os.path.join(HOME, ".mem", "mem.toml"))
+
+
+def _read_toml_safe(path):
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+def _resolve_home():
+    """优先级：MEM_HOME 环境变量 > mem.toml 的 store.home > ~/.mem"""
+    if os.environ.get("MEM_HOME"):
+        return os.path.expanduser(os.environ["MEM_HOME"])
+    h = str((_read_toml_safe(_boot_cfg_path()).get("store") or {}).get("home") or "").strip()
+    return os.path.expanduser(h) if h else os.path.join(HOME, ".mem")
+
+
+BASE = _resolve_home()
 HOME_PATH = BASE  # cmd_serve 内 BASE 会被 Namespace 遮蔽，路径判断一律用这个
 DB_PATH = os.environ.get("MEM_DB", os.path.join(BASE, "mem.db"))
-CFG_PATH = os.environ.get("MEM_CONFIG", os.path.join(BASE, "mem.toml"))
+# 配置留在"引导位置"；若新 home 下也有一份 mem.toml（用户显式放的），以它为准
+_home_cfg = os.path.join(BASE, "mem.toml")
+CFG_PATH = os.environ.get("MEM_CONFIG") or (_home_cfg if os.path.exists(_home_cfg)
+                                            else _boot_cfg_path())
 TRUST_PATH = os.environ.get("MEM_TRUST", os.path.join(BASE, "trust.toml"))
 MODEL_DIR = os.environ.get("MEM_MODEL", os.path.join(BASE, "models", "e5-small-onnx"))
 ACTIVITY = os.path.join(BASE, "activity.log")
 
 DEFAULTS = {
+    "store.home": "",          # 空 = ~/.mem；改它可以把整库（db/日志/模型缓存）搬到别处
     "db.path": DB_PATH,
     "model.path": MODEL_DIR,
     "model.backend": "onnx",
@@ -1586,7 +1614,7 @@ quota.max_daily_writes       默认 300
         return
     if a.action == "path":
         _c = load_config()
-        print(json.dumps({"config": CFG_PATH,
+        print(json.dumps({"config": CFG_PATH, "home": BASE,
                           "db": os.path.expanduser(_c.get("db.path") or DB_PATH),
                           "model": os.path.expanduser(_c.get("model.path") or MODEL_DIR),
                           "activity": ACTIVITY}, ensure_ascii=False, indent=2))

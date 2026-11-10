@@ -29,7 +29,7 @@ import { promisify } from "node:util";
 import { appendFile, mkdir } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
@@ -74,7 +74,34 @@ const ENDPOINT = process.env.MEM_ENDPOINT ?? "";
 const PORT = Number(process.env.MEM_PORT ?? 7788);
 const BASE = `http://127.0.0.1:${PORT}`;
 
-const MEM_HOME = process.env.MEM_HOME ?? join(homedir(), ".mem");
+/** 极小 TOML 读取：只取 [section] 下的 key = "value"（配置由 mem.py 拥有，这里只读一个值） */
+function readTomlStr(path: string, section: string, key: string): string {
+	try {
+		if (!existsSync(path)) return "";
+		let cur = "";
+		for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+			const s = line.trim();
+			if (!s || s.startsWith("#")) continue;
+			const sec = s.match(/^\[([A-Za-z0-9_.-]+)\]$/);
+			if (sec) {
+				cur = sec[1];
+				continue;
+			}
+			const kv = s.match(/^([A-Za-z0-9_.-]+)\s*=\s*"?([^"]*)"?\s*(?:#.*)?$/);
+			if (!kv) continue;
+			const full = cur ? `${cur}.${kv[1]}` : kv[1];
+			if (full === `${section}.${key}`) return kv[2].trim();
+		}
+	} catch {
+		/* ignore */
+	}
+	return "";
+}
+
+/** 记忆目录：MEM_HOME > mem.toml 的 store.home > ~/.mem（与 mem.py 同一套优先级） */
+const BOOT_CFG = process.env.MEM_CONFIG ?? join(homedir(), ".mem", "mem.toml");
+const MEM_HOME =
+	process.env.MEM_HOME || readTomlStr(BOOT_CFG, "store", "home") || join(homedir(), ".mem");
 const LOG_PATH = join(MEM_HOME, "pi-adapter.log");
 
 // ---- 触发阈值（实测：本会话 123 轮 / 453K token / 平均 3.7K 每轮）----
@@ -350,11 +377,11 @@ function loadConfig(cwd: string): Record<string, any> {
 	return out;
 }
 
-function resolveScope(cwd: string): string {
-	if (process.env.MEM_SCOPE) return process.env.MEM_SCOPE;
-	const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
-	if (norm(cwd) === norm(homedir())) return "home";
-	return basename(cwd) || "default";
+function resolveScope(_cwd: string): string {
+	// 默认所有目录共用一份记忆（scope=home）。曾经按 cwd 目录名分段，
+	// 结果在叫「测试」的目录里跑 pi 就变成一份独立记忆库，和 home 完全隔离。
+	// 要分项目记忆请显式设 MEM_SCOPE 或 memskill.json 的 scope。
+	return process.env.MEM_SCOPE || "home";
 }
 
 async function log(rec: Record<string, unknown>) {
