@@ -585,7 +585,9 @@ export default function (pi: ExtensionAPI) {
 			| Array<{ id: string; scope: string; title: string; score: number }>
 			| null;
 		if (isFirstTurn && doms && doms.length) {
-			const list = doms.map((d) => `${d.id}「${d.title}」`).join("、");
+			const list = doms
+				.map((d) => `${(d as any).own ? "" : "〔旧会话〕"}${d.id}「${d.title}」`)
+				.join("、");
 			const line =
 				`[mem:domains] 相关历史会话：${list}。` +
 				`需要细节用 python "${MEM_PY}" segment get <id>`;
@@ -596,13 +598,22 @@ export default function (pi: ExtensionAPI) {
 		// 段闭合 → 把新段的指针追加到 tail（放 tail 不放 system：
 		// 段索引会话内会变几次，放 system 每次都是全量重算）
 		const seg = (out as any).segment as
-			| { action?: string; closed?: { id: string; title: string; digest?: string; turns: number[] } }
+			| {
+					action?: string;
+					closed?: {
+						id: string; title: string; digest?: string; turns: number[];
+						session_seq?: number; session_total?: number;
+					};
+			  }
 			| null;
 		if (seg?.action === "close" && seg.closed) {
 			const c = seg.closed;
+			const nth = c.session_seq && c.session_total
+				? `本会话第 ${c.session_seq}/${c.session_total} 段｜`
+				: "";
 			const line =
 				`[mem:seg] 已归档 ${c.id}｜${c.title}｜第 ${c.turns?.[0]}–${c.turns?.[1]} 轮｜` +
-				`原文：python "${MEM_PY}" segment get ${c.id}`;
+				nth + `原文：python "${MEM_PY}" segment get ${c.id}`;
 			tailText = tailText ? tailText + "\n\n" + line : line;
 			try {
 				ctx.sessionManager.appendCustomEntry("mem_segment", {
@@ -617,7 +628,8 @@ export default function (pi: ExtensionAPI) {
 		if (pendingSegIndex) {
 			pendingSegIndex = false;
 			try {
-				const b = await runPy(["segment", "brief", "--scope", scope, "--limit", "5"]);
+				const b = await runPy(["segment", "brief", "--scope", scope, "--limit", "5",
+					"--session", sid]);
 				if (b && b.text) {
 					tailText = tailText ? tailText + "\n\n" + b.text : b.text;
 					ctx.sessionManager.appendCustomEntry("mem_segindex", {

@@ -2114,9 +2114,12 @@ def _seg_close(con, st, scope, last_id, turn_last, reason):
                     (prev["id"], seg_id, "continues", 1.0, int(time.time())))
     con.execute("DELETE FROM mem_segment_state WHERE session_id=?", (st["session_id"],))
     con.commit()
+    total = con.execute("SELECT COUNT(*) c FROM mem_segments WHERE session_id=?",
+                        (st["session_id"],)).fetchone()["c"]
     return {"id": seg_id, "title": title, "digest": digest,
             "turns": [st["turn_start"], turn_last], "n_tok": st["n_tok"],
-            "reason": reason, "prev": prev["id"] if prev else None}
+            "reason": reason, "prev": prev["id"] if prev else None,
+            "session_seq": st["seq"], "session_total": total}
 
 
 def track_segment(con, sid, scope, text, turn, entry_id, turn_tokens=0, transcript=None):
@@ -2310,7 +2313,7 @@ def cmd_segment(a):
         n = int(a.limit or 5)
         chars = int(getattr(a, "chars", 40) or 40)
         def _rows(only_enriched):
-            sql = ("SELECT id,scope,title,digest,turn_start,turn_end,enriched "
+            sql = ("SELECT id,scope,session_id,title,digest,turn_start,turn_end,enriched "
                    "FROM mem_segments WHERE 1=1")
             params = []
             if only_enriched:
@@ -2335,8 +2338,9 @@ def cmd_segment(a):
             d = _seg_flat(r["digest"] or "", chars)
             ts, te = r["turn_start"] or 0, r["turn_end"] or 0
             turns = ("第 %s–%s 轮" % (ts, te)) if (ts and te and te >= ts) else                     ("第 %s 轮" % ts if ts else "")
-            lines.append("%s｜%s｜%s｜%s" % (
-                r["id"], _seg_flat(r["title"] or "", 20), turns, d))
+            mine = bool(getattr(a, "session", None)) and r["session_id"] == a.session
+            lines.append("%s｜%s%s｜%s｜%s" % (
+                r["id"], "" if mine else "〔旧会话〕", _seg_flat(r["title"] or "", 20), turns, d))
             ids.append(r["id"])
         text = chr(10).join(lines)
         print(json.dumps({"text": text, "ids": ids, "count": len(rows),
@@ -3063,7 +3067,7 @@ def _search_core(con, cfg, query, scope, top_n=30):
     return rank(cands, q_grams=q_grams, graph=graph)
 
 
-def _activate_domains(con, query, scope, k=3, min_score=0.5):
+def _activate_domains(con, query, scope, k=3, min_score=0.5, sid=None):
     """用 query 找相关历史段，按域聚合。第一轮注入用。"""
     qv = embed(["query: " + query])[0]
     sql = ("SELECT id,scope,session_id,title,digest,vector,created_at,turn_start,turn_end"
@@ -3097,7 +3101,8 @@ def _activate_domains(con, query, scope, k=3, min_score=0.5):
             continue
         seen.add(r["id"])
         out.append({"id": r["id"], "scope": r["scope"], "title": r["title"],
-                    "score": round(sc, 3), "turns": [r["turn_start"], r["turn_end"]]})
+                    "score": round(sc, 3), "turns": [r["turn_start"], r["turn_end"]],
+                    "own": bool(sid) and r["session_id"] == sid})
     return out
 
 
@@ -3129,7 +3134,7 @@ def cmd_retrieve(a):
     domains = []
     if (getattr(a, "turn", None) or 0) <= 1 and query:
         try:
-            domains = _activate_domains(con, query, scope, k=3)
+            domains = _activate_domains(con, query, scope, k=3, sid=sid)
         except Exception:
             domains = []
 
@@ -3455,6 +3460,7 @@ def main():
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
     sgb = sgs.add_parser("brief")
     sgb.add_argument("--scope", default=None)
+    sgb.add_argument("--session", default=None, help="标注哪些段属于本会话")
     sgb.add_argument("--limit", type=int, default=5)
     sgb.add_argument("--chars", type=int, default=40)
     sgb.add_argument("--all", dest="all_segments", action="store_true",
