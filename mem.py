@@ -2339,13 +2339,31 @@ def cmd_segment(a):
                 sql += " AND scope IN (?, 'global')"
                 params.append(a.scope)
             sql += " ORDER BY created_at DESC LIMIT ?"
-            params.append(n)
+            # 多取一段余量：min_turns 不满足时往下捞，由调用方按轮数截断
+            params.append(n + (5 if getattr(a, "min_turns", 0) else 0))
             return con.execute(sql, params).fetchall()
 
         # 默认只要模型写过摘要的段：L1 兜底段的标题是原始用户文本，又长又吵
         rows = [] if getattr(a, "all_segments", False) else _rows(True)
         if not rows:
             rows = _rows(False)
+
+        # 拆段后一轮可能 2–3 段：只取 5 段可能只覆盖最近 2 轮，
+        # 所以按"段数够 且 覆盖轮数够"来截断（硬上限给足余量，避免无限拉）
+        min_turns = int(getattr(a, "min_turns", 0) or 0)
+        if min_turns > 0 and rows:
+            soft, hard = int(a.limit or 5), int(a.limit or 5) + 5
+            picked = []
+            for r in rows:                      # rows 已按时间倒序
+                picked.append(r)
+                ts = [x["turn_start"] or 0 for x in picked]
+                te = [x["turn_end"] or 0 for x in picked]
+                span = (max(te) - min(ts) + 1) if ts else 1
+                if len(picked) >= soft and span >= min_turns:
+                    break
+                if len(picked) >= hard:
+                    break
+            rows = picked
         if not rows:
             print(json.dumps({"text": "", "ids": [], "count": 0}, ensure_ascii=False))
             return
@@ -3485,6 +3503,8 @@ def main():
     sgb.add_argument("--session", default=None, help="标注哪些段属于本会话")
     sgb.add_argument("--limit", type=int, default=5)
     sgb.add_argument("--chars", type=int, default=40)
+    sgb.add_argument("--min-turns", dest="min_turns", type=int, default=3,
+                     help="覆盖轮数不足时多取几段（拆段后一轮可能 2-3 段）")
     sgb.add_argument("--all", dest="all_segments", action="store_true",
                      help="包含没有 L2 摘要的 L1 兜底段（标题是原始用户文本，通常更长更吵）")
     sgb.add_argument("--pretty", action="store_true")
