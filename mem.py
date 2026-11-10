@@ -86,6 +86,8 @@ DEFAULTS = {
     "harvest.stale_min": "5",
     "segment.drift_threshold": "0",
     "segment.w_sem": "0.50",
+    "segment.domains_min_sim": "0.885",
+    "segment.domains_min_gap": "0.008",
     "segment.w_kw": "0.50",
     "segment.max_turns": "15",
     "segment.max_tokens": "12000",
@@ -1386,6 +1388,8 @@ CFG_RANGES = {
     "segment.drift_threshold": (0, 1, "float"),
     "segment.w_sem": (0, 1, "float"),
     "segment.w_kw": (0, 1, "float"),
+    "segment.domains_min_sim": (0.5, 1, "float"),
+    "segment.domains_min_gap": (0, 0.2, "float"),
     "quota.max_writes_per_minute": (1, 600, "int"),
     "quota.max_searches_per_minute": (1, 6000, "int"),
     "quota.max_daily_writes": (1, 100000, "int"),
@@ -3481,6 +3485,22 @@ def _activate_domains(con, query, scope, k=3, min_score=0.5, sid=None,
     nk = norm([x[1] for x in raw])
     scored = sorted(((w_sem * a1 + w_kw * b1, x[2]) for a1, b1, x in zip(ns, nk, raw)),
                     key=lambda t: -t[0])
+    # 相关性闸门：min-max 归一化让首选恒为 1.0，min_score 挡不住无关提问
+    # （实测"今天午饭吃什么"也会注入 3 段历史）。
+    # 只能用**绝对余弦**判：23 条有答案的真实提问 top1 落在 0.888-0.954，
+    # 7 条无关提问落在 0.845-0.881；峰度(top1-top2) 也分离（0.039+ vs 0.006-）。
+    # 两个信号任一成立就注入，宁可多给一条线索，不要漏掉上次会话。
+    try:
+        cfg = load_config()
+        min_sim = fcfg(cfg, "segment.domains_min_sim")
+        min_gap = fcfg(cfg, "segment.domains_min_gap")
+    except Exception:
+        min_sim, min_gap = 0.885, 0.008
+    if raw:
+        sims = sorted((x[0] for x in raw), reverse=True)
+        gap = (sims[0] - sims[1]) if len(sims) > 1 else sims[0]
+        if sims[0] < min_sim and gap < min_gap:
+            return []
     out, seen = [], set()
     for sc, r in scored:
         if sc < min_score or len(out) >= k:
@@ -3490,7 +3510,59 @@ def _activate_domains(con, query, scope, k=3, min_score=0.5, sid=None,
         seen.add(r["id"])
         out.append({"id": r["id"], "scope": r["scope"], "title": r["title"],
                     "score": round(sc, 3), "turns": [r["turn_start"], r["turn_end"]],
+                    "session": r["session_id"],
                     "own": bool(sid) and r["session_id"] == sid})
+    return out
+
+
+def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
+    """上一个会话是怎么收尾的——跨会话联络的最小实现。
+
+    为什么需要：首轮的 [mem:domains] 是“按语义找相关段”，新会话第一句话
+    往往不相关（“继续”“接着做”），于是那次会话最后做到哪根本不会出现。
+
+    只取别的会话、同 scope 的段（不借 global：global 是通识不是“上次做到哪”），
+    取最近那个会话的最后 k 段，并带上它的 decision/rejected 陈述——
+    决策才是“下一步接什么”的状态。
+    """
+    max_age = SESSION_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    sql = ("SELECT id,session_id,seq,title,digest,turn_start,turn_end,statements,created_at"
+           " FROM mem_segments WHERE enriched=1 AND session_id<>''")
+    params = []
+    if sid:
+        sql += " AND session_id<>?"
+        params.append(sid)
+    if scope:
+        sql += " AND scope=?"
+        params.append(scope)
+    sql += " ORDER BY created_at DESC LIMIT 40"
+    rows = con.execute(sql, params).fetchall()
+    if not rows:
+        return []
+    now = int(time.time())
+    last_sid = rows[0]["session_id"]
+    picked = [r for r in rows if r["session_id"] == last_sid][:k]
+    if not picked:
+        return []
+    age_days = (now - int(picked[0]["created_at"] or now)) / 86400.0
+    if max_age and age_days > max_age:
+        return []
+    picked.reverse()
+    out = []
+    for r in picked:
+        stmts = []
+        try:
+            for st in (json.loads(r["statements"] or "[]") or []):
+                if str(st.get("kind")) in ("decision", "rejected") and st.get("text"):
+                    stmts.append(str(st["text"]))
+        except Exception:
+            pass
+        out.append({"id": r["id"], "title": r["title"] or "",
+                    "digest": r["digest"] or "",
+                    "turns": [r["turn_start"], r["turn_end"]],
+                    "session": last_sid,
+                    "age_hours": max(0, (now - int(r["created_at"] or now)) // 3600),
+                    "statements": stmts[:2]})
     return out
 
 
@@ -3520,6 +3592,7 @@ def cmd_retrieve(a):
 
     # 第一轮顺带做域激活：拿当前 query 找相关历史段，返回给宿主注入
     domains = []
+    handoff = []
     if (getattr(a, "turn", None) or 0) <= 1 and query:
         try:
             domains = _activate_domains(con, query, scope, k=3, sid=sid,
@@ -3527,6 +3600,14 @@ def cmd_retrieve(a):
                                         w_kw=fcfg(cfg, "segment.w_kw"))
         except Exception:
             domains = []
+        try:
+            handoff = _last_session_handoff(con, scope, sid)
+            # 域激活已经点到那个会话就不重复报一次（省 token，也避免两条块打架）
+            seen_sessions = {d.get("session") for d in domains if not d.get("own")}
+            if handoff and handoff[0]["session"] in seen_sessions:
+                handoff = []
+        except Exception:
+            handoff = []
 
     t0 = time.time()
     ranked = _search_core(con, cfg, query, scope, a.candidates)
@@ -3536,6 +3617,7 @@ def cmd_retrieve(a):
                           "tail": {"text": "", "ids": []},
                           "insert": {"system": "append", "afterUserText": "\n\n"},
                           "domains": domains,
+                          "handoff": handoff,
                           "segment": seg_info, "debug": {"candidates": 0}}, ensure_ascii=False)); return
 
     cache = "hit"
@@ -3611,6 +3693,7 @@ def cmd_retrieve(a):
         "insert": {"system": "append", "afterUserText": "\n\n"},
         "segment": seg_info,
         "domains": domains,
+        "handoff": handoff,
         "debug": {"candidates": len(ranked), "best": round(best, 4), "floor": round(floor, 4),
                   "drift": drift, "reanchors": reanchors, "elapsedMs": int(dt * 1000)},
     }, ensure_ascii=False, indent=2 if a.pretty else None))
@@ -3650,6 +3733,7 @@ def cmd_hook(a):
         "stable_hash": stable.get("hash") or "",
         "ids": {"stable": stable.get("ids") or [], "tail": tail.get("ids") or []},
         "domains": domains,
+        "handoff": d.get("handoff") or [],
         "segment": seg,
         "insert": d.get("insert") or {"system": "append", "afterUserText": "\n\n"},
         "lanes": {

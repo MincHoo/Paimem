@@ -634,7 +634,33 @@ export default function (pi: ExtensionAPI) {
 				`[mem:domains] 相关历史会话：${list}。` +
 				`需要细节用 python "${MEM_PY}" segment get <id>`;
 			tailText = tailText ? tailText + "\n\n" + line : line;
+		}
 
+		// 首轮：上次会话收尾于哪里（跨会话联络）。域激活是“按语义找相关”，
+		// 而新会话第一句经常不相关（「继续」「接着做」），这时那条路什么也找不到。
+		const hoff = (out as any).handoff as
+			| Array<{
+					id: string;
+					title: string;
+					digest?: string;
+					turns?: number[];
+					age_hours?: number;
+					statements?: string[];
+			  }>
+			| null;
+		if (isFirstTurn && hoff && hoff.length) {
+			const h = hoff[hoff.length - 1]; // 最新那段 = 上个会话的收尾
+			const hrs = Number(h.age_hours ?? 0);
+			const age = hrs >= 24 ? `${Math.round(hrs / 24)} 天前` : hrs > 0 ? `${hrs} 小时前` : "刚刚";
+			const tv = h.turns && h.turns[0] ? `第 ${h.turns[0]}–${h.turns[1]} 轮｜` : "";
+			const dec = (h.statements ?? []).slice(0, 2).map((s) => `｜决策：${s}`).join("");
+			const dig = String(h.digest ?? "").slice(0, 60).replace(/[。；;]\s*$/, "");
+			const line =
+				`[mem:last] 上次会话（${age}）收尾于 ${h.id}「${h.title}」｜${tv}` +
+				dig +
+				dec +
+				`。需要原文：python "${MEM_PY}" segment get ${h.id} --part`;
+			tailText = tailText ? tailText + "\n\n" + line : line;
 		}
 
 		// 段闭合 → 把新段的指针追加到 tail（放 tail 不放 system：
