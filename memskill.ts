@@ -632,7 +632,8 @@ export default function (pi: ExtensionAPI) {
 
 		// 前台模式：上一轮没调用 mem_turn_close → 提醒一句（冗噪控制：只在漏记时出现）
 		if (FOREGROUND_ONLY && !commitNudged && stats.turns > 1) {
-			const line = "[mem] 上一轮未收口。本轮结束前用 mem_turn_close 记录结论；无结论可跳过。";
+			const line = "[mem] 上一轮未收口。收口时先调 mem_turn_close、再写正文（工具在前、答案在后，" +
+				"否则回答会被折叠）。无结论可跳过。";
 			tailText = tailText ? tailText + "\n\n" + line : line;
 		}
 		commitNudged = false;
@@ -792,6 +793,8 @@ export default function (pi: ExtensionAPI) {
 			"每句陈述必须自足：主体明确、指代换成具体名词、保留原路径与数字；" +
 			"用户只说「可以/赞同」时，必须还原出他赞同的具体内容。" +
 			"只有项目级常识（本项目专属的参数/阈值/路径/技巧）才带项目名；通识不要带。" +
+			"调用顺序：先调用本工具（工具调用全部结束后）再写最终回答——" +
+			"写在本工具之前的正文会被折叠进工具块，用户需要手动展开才能看到。" +
 			"若本轮推翻了旧记忆，在 supersedes 里给出 old_id 和完整新陈述。",
 		parameters: {
 			type: "object",
