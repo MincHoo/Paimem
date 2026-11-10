@@ -534,7 +534,9 @@ export default function (pi: ExtensionAPI) {
 		// 所以第一轮不计入，从第二轮开始用真实增量。
 		const totalTokens = Math.round(segChars / CHARS_PER_TOKEN);
 		const delta = totalTokens - lastSegTokens;
-		const turnTokens = firstTurnAfterStart ? 0 : Math.min(6000, Math.max(1, delta));
+		// 上限只防病态增量（压缩/恢复会话时 delta 会跳变），不能低于段上限，
+		// 否则 n_tok 会统一卡在 6000，SEG_MAX_TOKENS 等于永不触发（实测 15 段卡在 6000）
+		const turnTokens = firstTurnAfterStart ? 0 : Math.min(24000, Math.max(1, delta));
 		firstTurnAfterStart = false;
 		lastSegTokens = totalTokens;
 

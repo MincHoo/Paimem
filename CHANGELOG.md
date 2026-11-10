@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.10.0] - 2026-11-10
+
+**前台化**：废除后台 L2/harvest 路径（代码物理删除，不是开关），改为每轮由主模型收口。
+收口纯本地、0 LLM 调用；摘要只在段闭合/压缩前/会话结束这类事件上跑。
+
+### 新增接口
+- `mem.py hook`：宿主无关的锚点入口，返回 `{system, tail, domains, handoff, segment, lanes}`；
+  四个通道（持久记忆 / 工作记忆 / 知识库 / 注意力）共用这一个入口，失败只降级该通道
+- `mem.py config keys|set|describe|path`：46+ 项可调参数，带范围校验与写后回读
+- `mem_turn_close` / `mem_supersede`：前台模式的三写；一轮可多次调用（一轮几个主题写几段）
+- `restore <id>`：推翻错了能退回来（清 `superseded_by`、删 `replaces` 边、记事件）
+
+### 工作记忆（段）
+- 首轮 `[mem:domains]`：按语义找相关历史段（3 条），带〔旧会话〕标记
+- 首轮 `[mem:last]`：上次会话的收尾段 + 决策（跨会话联络），域激活已命中则不重复
+- 压缩后 `[mem:seg-index]`：补一次段指针块（只一次）
+- 段闭合时追加一行指针到 tail（不放 system：system 会全量重算）
+- `segment brief|list|get --part|activate|enrich|commit|finalize|rm`
+- 修复命令：`segment repair-turns`（turn 倒挂）、`segment repair-transcript`（孤儿段）、
+  `repair-edges`（矛盾边降级/清自环悬空）。三者默认只预演，`--apply` 才写库，都记 `mem_events`
+
+### 检索质量（有尺子再改）
+- `eval_seg.py`：23 条真实用户原话做查询的段检索基准（`--frozen` 可跨版本比较）
+- 标定结论：段向量窗口 `title 20 / digest 100 / 陈述不设上限`、`min_score 0.50`、`k=3`
+  都不动（全在噪声内）；**唯一显著收益来自摘要质量**（Hit@3 82.6%→87.0%、MRR 0.704→0.772）
+- 首轮域激活加绝对余弦闸门（`0.885` / 峰度 `0.008`）：无关提问不再注入 3 段历史
+- 矛盾判别器：从「数字不同即矛盾」（8 条边只对 1 条）改为「词面重合 + 单位/互补/舍入」，
+  回放 8 条边保留 1、降级 5、删除 2；`mem_fetch` 现在会渲染 `⚠ 与之矛盾`/`已被替换为`
+
+### 健壮性
+- daemon：`/health` 返回 `home` 与启动时的代码 mtime，宿主发现常驻进程跑旧代码就换新进程；
+  空闲 900s 自退；端口被别的 `MEM_HOME` 占用时不复用
+- `_seg_close` 落库前夹紧 `turn_end`（压缩后宿主轮次会回退，实测 23→2）
+- 段原文按 turn 切片（修掉「每段丢最后一条助手回答」与 `first_id` 空回退整个会话）
+- LLM 摘要被 `max_tokens` 截断时会用更大预算重试一次
+- 收口 payload 自检：陈述主体、纯寒暄段（0 陈述 + 极短）拒收
+
 ## [0.9.0] - 2026-11-10
 
 首个公开版本。功能完整，**仅 Windows + pi 验证过**。

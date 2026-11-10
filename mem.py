@@ -2572,6 +2572,14 @@ def cmd_segment(a):
             return
         title = _seg_flat(d.get("title") or "", SEG_TITLE_CHARS) or "(未命名段)"
         digest = _seg_flat(d.get("digest") or "", SEG_DIGEST_CHARS)
+        # 正确性校验（不是业务上限）：纯寒暄不该成段。
+        # 实测模型会把「你好」收口成段（0 条陈述、n_tok=5），它会成为下一次
+        # [mem:last] 的指向，把最有价值的“上次做到哪”顶掉。
+        if not stmts and len(title) + len(digest) < 70 and not getattr(a, "force", False):
+            print(json.dumps({"ok": True, "skipped": "too_thin",
+                              "hint": "纯寒暄/无结论不必收口；确实要记加 --force"},
+                             ensure_ascii=False))
+            return
         txt_all = " ".join(str(x.get("text")) for x in stmts)
         st = _seg_state(con, sid) if sid else None
         if st:
@@ -2655,6 +2663,26 @@ def cmd_segment(a):
                           "errors": errs, "promoted": promoted,
                           "conflicts": conflicts[:5], "superseded": superseded},
                          ensure_ascii=False, indent=2))
+        return
+
+    if sub == "rm":
+        """删掉一条段（连同它的边）。用于清理误收录的寒暄段/测试段。"""
+        sid_rm = a.id
+        row = con.execute("SELECT id,title FROM mem_segments WHERE id=?", (sid_rm,)).fetchone()
+        if not row:
+            print(json.dumps({"error": "not_found", "id": sid_rm}, ensure_ascii=False)); return
+        if not getattr(a, "force", False):
+            print(json.dumps({"ok": False, "need_force": True, "id": sid_rm,
+                              "title": row["title"], "hint": "删段不可恢复，加 --force"},
+                             ensure_ascii=False)); return
+        n_e = con.execute("DELETE FROM mem_edges WHERE src_id=? OR dst_id=?",
+                          (sid_rm, sid_rm)).rowcount
+        con.execute("DELETE FROM mem_segments WHERE id=?", (sid_rm,))
+        con.execute("INSERT INTO mem_events(ts,action,item_id,actor,detail) VALUES(?,?,?,?,?)",
+                    (int(time.time()), "segment_rm", sid_rm, a.actor,
+                     json.dumps({"edges": n_e, "title": row["title"]}, ensure_ascii=False)))
+        con.commit()
+        print(json.dumps({"ok": True, "removed": sid_rm, "edges": n_e}, ensure_ascii=False))
         return
 
     if sub == "repair-transcript":
@@ -3526,8 +3554,10 @@ def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
     决策才是“下一步接什么”的状态。
     """
     max_age = SESSION_MAX_AGE_DAYS if max_age_days is None else max_age_days
-    sql = ("SELECT id,session_id,seq,title,digest,turn_start,turn_end,statements,created_at"
-           " FROM mem_segments WHERE enriched=1 AND session_id<>''")
+    sql = ("SELECT id,session_id,seq,title,digest,turn_start,turn_end,statements,created_at,n_tok"
+           " FROM mem_segments WHERE enriched=1 AND session_id<>''"
+           # 只要“有实质内容”的段：纯寒暄段（无陈述、几乎没内容）不能当上次收尾
+           " AND (COALESCE(statements,'')<>'[]' OR COALESCE(n_tok,0)>=60)")
     params = []
     if sid:
         sql += " AND session_id<>?"
@@ -3535,13 +3565,21 @@ def _last_session_handoff(con, scope, sid, k=2, max_age_days=None):
     if scope:
         sql += " AND scope=?"
         params.append(scope)
-    sql += " ORDER BY created_at DESC LIMIT 40"
+    sql += " ORDER BY created_at DESC LIMIT 60"
     rows = con.execute(sql, params).fetchall()
     if not rows:
         return []
     now = int(time.time())
-    last_sid = rows[0]["session_id"]
-    picked = [r for r in rows if r["session_id"] == last_sid][:k]
+    picked = []
+    last_sid = ""
+    for cand in rows:                # 按时间倒序扫：取第一个有实质段的那个会话
+        if not last_sid:
+            last_sid = cand["session_id"]
+        if cand["session_id"] != last_sid:
+            break
+        picked.append(cand)
+        if len(picked) >= k:
+            break
     if not picked:
         return []
     age_days = (now - int(picked[0]["created_at"] or now)) / 86400.0
@@ -3941,6 +3979,10 @@ def main():
     sgf.add_argument("--no-enrich", dest="no_enrich", action="store_true",
                      help="只本地收口，不调 LLM（前台模式的关窗路径）")
     sgf.add_argument("--dry-run", dest="dry_run", action="store_true")
+    sgm = sgs.add_parser("rm")
+    sgm.add_argument("id")
+    sgm.add_argument("--force", action="store_true", help="确认删除（不可恢复）")
+    sgm.set_defaults(segment_cmd="rm")
     sgt = sgs.add_parser("repair-transcript")
     sgt.add_argument("--apply", action="store_true", help="真的写库（默认只预演）")
     sgt.set_defaults(segment_cmd="repair-transcript")
